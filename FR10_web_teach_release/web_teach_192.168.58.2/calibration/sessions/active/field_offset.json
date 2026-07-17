@@ -1,0 +1,10 @@
+{
+  "description": "手眼标定现场死区修正：加在最终 TCP 目标点（基座坐标 +X/+Y/+Z，单位 mm，可为负）",
+  "apply_to": "final_tcp",
+  "deadzone_mm": [
+    -2.0,
+    -2.0,
+    -3.0
+  ],
+  "note": "quickchanger 现场补偿：阶段2最终点使用 -2 -2 -3；阶段1由 quickchanger prelift 40mm 得到 -2 -2 37"
+}

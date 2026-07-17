@@ -1,0 +1,18 @@
+# FR10 网页示教器 — 发布版依赖说明
+#
+# 示教器脚本 fr10_web_teach.py 除 FAIRINO 机械臂 SDK 外，仅使用 Python 标准库，
+# 故无必须可从 PyPI 安装的第三方包。
+#
+# ---- 运行前请安装与控制器版本匹配的 FAIRINO Python SDK ----
+# 常见方式（择一）：
+#   pip install /path/to/fairino-*.whl
+# 或将 SDK 解压后把含 fairino 包或 Robot 模块的目录加入 PYTHONPATH，例如：
+#   export PYTHONPATH="/path/to/fairino-python-sdk/linux:$PYTHONPATH"
+#
+# 验证：
+#   python3 -c "from fairino import Robot"   # 或: python3 -c "import Robot"
+#
+# Python 版本：建议 3.9+（脚本使用 from __future__ import annotations）。
+
+# 电机串口控制需要
+pyserial
