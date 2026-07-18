@@ -482,6 +482,7 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
     rob = qc._load_robot(args.host)
 
     best = None
+    valid_matches = []
     seen_once = False
     lost_after_seen = 0
     triggered = False
@@ -585,8 +586,8 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
                     f"pose_sync={pose_sync_mode} skew={pose_skew_ms:.1f}ms "
                     f"frame_latency={frame_latency_ms:.1f}ms"
                 )
-                if ok_for_score and (best is None or score > best["score"]):
-                    best = {
+                if ok_for_score:
+                    match = {
                         "score": score,
                         "pose": tcp_pose[:6],
                         "frame": frame_idx,
@@ -598,9 +599,19 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
                         "frame_latency_ms": frame_latency_ms,
                         "rs_frame_no": rs_frame_no,
                     }
+                    valid_matches.append(match)
+                    mid_idx = (len(valid_matches) - 1) // 2
+                    best = valid_matches[mid_idx]
                     print(
-                        f"[SMOOTH] 更新最佳视角：frame={frame_idx}, "
-                        f"score={score:.1f}, tcp={[round(x, 2) for x in tcp_pose[:6]]}"
+                        f"[SMOOTH] 记录有效匹配 #{len(valid_matches)}："
+                        f"frame={frame_idx}, score={score:.1f}, "
+                        f"tcp={[round(x, 2) for x in tcp_pose[:6]]}"
+                    )
+                    print(
+                        f"[SMOOTH] 当前中间匹配视角："
+                        f"match_index={mid_idx + 1}/{len(valid_matches)}, "
+                        f"frame={best['frame']}, "
+                        f"tcp={[round(x, 2) for x in best['pose']]}"
                     )
                 elif not ok_for_score:
                     print(
@@ -672,10 +683,10 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
         )
 
         if not triggered:
-            print("[SMOOTH] 连续扫描结束，使用历史最佳视角执行 quickchanger")
+            print("[SMOOTH] 连续扫描结束，使用历史中间匹配视角执行 quickchanger")
 
         print(
-            f"[SMOOTH] 最佳视角 frame={best['frame']}, "
+            f"[SMOOTH] 中间匹配视角 frame={best['frame']}, "
             f"rs_frame={best.get('rs_frame_no')}, "
             f"t={best['scan_t']:.2f}s, score={best['score']:.1f}, "
             f"pose_skew={best.get('pose_skew_ms', 0.0):.1f}ms, "

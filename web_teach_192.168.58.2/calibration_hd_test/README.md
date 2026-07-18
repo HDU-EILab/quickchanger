@@ -83,7 +83,7 @@ quickchanger_config.json
 | `scan_steps` | 段数 | `run_quickchanger_demo` 分段扫描数量，只影响分段 demo。 | `20-80` |
 | `demo_scan_vel` | `%` | `run_quickchanger_demo` 分段扫描 MoveL 速度。 | `10-60` |
 | `demo_settle_s` | 秒 | 分段 demo 每个扫描点到位后等待相机稳定的时间。 | `0-0.1` |
-| `min_perimeter_px` | 像素 | ArUco 参与最佳视角评分的最小周长阈值。 | `80-200` |
+| `min_perimeter_px` | 像素 | ArUco 参与有效匹配记录的最小周长阈值。 | `80-200` |
 | `smooth_scan_vel` | `%` | `run_quickchanger_smooth` 连续扫描 MoveL 速度。 | `20-80` |
 | `smooth_sample_hz` | Hz | smooth 连续移动时 ArUco 检测采样频率。高速扫描时应尽量接近相机帧率。 | `12-30` |
 | `smooth_stop_on_lost` | bool | smooth 首次识别后连续丢失目标时是否调用 `StopMotion` 提前结束扫描。 | `true` 更快；`false` 更保守 |
@@ -152,8 +152,8 @@ quickchanger_config.json
 
 1. 先移动到演示扫描起点。
 2. 子进程下发一条从起点到终点的高速连续 `MoveL`。
-3. 主进程在连续移动过程中按 `smooth_sample_hz` 只取彩色帧识别 ArUco；扫描阶段可用 `smooth_scan_detect_scale=0.5` 半分辨率检测并映射回原图，同时用 `smooth_pose_sync_mode=buffer` 从后台 TCP 位姿缓冲中按 RealSense 图像帧时间插值同步；深度只在回到最佳视角后的最终定位阶段采集。
-4. 首次有效识别后若连续 `lost_after_visible` 帧未识别到目标，默认调用 `StopMotion` 结束扫描，再回到历史最佳视角。
+3. 主进程在连续移动过程中按 `smooth_sample_hz` 只取彩色帧识别 ArUco；扫描阶段可用 `smooth_scan_detect_scale=0.5` 半分辨率检测并映射回原图，同时用 `smooth_pose_sync_mode=buffer` 从后台 TCP 位姿缓冲中按 RealSense 图像帧时间插值同步；满足 `min_perimeter_px` 的有效匹配会按时间顺序记录，深度只在回到中间匹配视角后的最终定位阶段采集。
+4. 首次有效识别后若连续 `lost_after_visible` 帧未识别到目标，默认调用 `StopMotion` 结束扫描，再回到有效匹配序列的中间次匹配位置；奇数次匹配取正中间，偶数次匹配取偏前一帧，避免继续往扫描方向过头。
 5. 复查 ArUco 稳定后，调用与 `run_quickchanger` 相同的两阶段最终定位逻辑。
 
 调试参数：
@@ -167,7 +167,7 @@ quickchanger_config.json
 ./run_quickchanger_smooth --scan-detect-scale 1.0
 ```
 
-如果高速扫描后“回到最佳视角”仍有一点错位：
+如果高速扫描后“回到中间匹配视角”仍有一点错位：
 
 - 回到的位置偏扫描方向后方/已经越过目标：调大 `smooth_frame_time_offset_s`，例如 `0.16`、`0.20`。
 - 回到的位置偏扫描方向前方/还没到目标：调小 `smooth_frame_time_offset_s`，例如 `0.08`。
