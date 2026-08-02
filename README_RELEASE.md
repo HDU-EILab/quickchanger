@@ -69,7 +69,7 @@ PORT=9000 ./run_web_teach.sh
 
 ## Quickchanger 演示
 
-网页内 Quickchanger 演示流程支持填写 ArUco ID，默认 ID 为 `1`。后端默认执行：
+网页内 Quickchanger 演示流程支持填写 ArUco ID，默认 ID 为 `1`。当前版本已完成多编号演示流程适配：同一流程只锁定指定编号，看到其它编号即结束目标窗口并使用目标窗口内的中间有效视角。后端默认执行：
 
 ```text
 web_teach_192.168.58.2/calibration_hd_test/quickchanger_smooth_sweep_hd.py
@@ -78,7 +78,7 @@ web_teach_192.168.58.2/calibration_hd_test/quickchanger_smooth_sweep_hd.py
 当前交付默认参数在 `quickchanger_config.json` 中：
 
 ```text
-smooth_scan_vel = 30.0
+smooth_scan_vel = 35.0
 lost_after_visible = 2
 smooth_scan_detect_scale = 0.5
 smooth_frame_time_offset_s = 0.12
@@ -106,3 +106,9 @@ cd web_teach_192.168.58.2/calibration_hd_test
 - 页面内已包含电机 `正转/反转/停止` 控制。
 - 首次使用请填写串口端口（默认留空），Linux 常见如 `/dev/ttyUSB0`。
 - 运行用户需要具备串口访问权限（通常加入 `dialout` 组）。
+
+## 末端电钻工具（已集成）
+
+- 页面内已增加 `切换电钻 20V` 与 `电钻点动 1s`。
+- 电钻档案使用末端电源 3 号设备，默认 `20V / 2A`。
+- 电钻接通电源后会立即转动，页面会在打开输出前要求确认。

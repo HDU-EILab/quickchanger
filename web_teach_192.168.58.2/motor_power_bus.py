@@ -51,7 +51,16 @@ REG_CC_CV = 0x0402
 DEVICE_PROFILES = {
     "1": {"name": "灵巧手", "rack_id": 1, "voltage_v": 8.4, "current_a": 2.0},
     "2": {"name": "夹爪", "rack_id": 2, "voltage_v": 24.0, "current_a": 2.0},
+    "3": {
+        "name": "电钻",
+        "rack_id": 3,
+        "voltage_v": 20.0,
+        "current_a": 2.0,
+        "starts_immediately_on_power": True,
+    },
 }
+
+DRILL_DEMO_ON_SECONDS = 1.0
 
 MOTOR_COMMANDS = {
     "status_run": "01 03 00 00 00 01",
@@ -700,8 +709,11 @@ class MotorPowerBus:
         power.set_current_a(profile["current_a"])
         time.sleep(0.05)
         if not confirm_power_on:
+            msg = f"已设置 {profile['name']} 电源参数但未开输出，请确认接线后重试并带 confirm_power_on"
+            if profile.get("starts_immediately_on_power"):
+                msg = f"已设置 {profile['name']} 电源参数但未开输出；该设备上电会立即转动，请确认固定和安全后重试"
             return _fail(
-                f"已设置 {profile['name']} 电源参数但未开输出，请确认接线后重试并带 confirm_power_on",
+                msg,
                 needs_confirm=True,
                 confirm_kind="power_on",
                 profile=profile,
@@ -716,6 +728,34 @@ class MotorPowerBus:
             current_device=profile["name"],
             power_status=status,
         )
+
+    @classmethod
+    def _drill_pulse(cls, power: CL200WPowerSupply, confirm_power_on: bool) -> dict:
+        profile = DEVICE_PROFILES["3"]
+        if not confirm_power_on:
+            return _fail(
+                f"电钻点动会以 {profile['voltage_v']}V / {profile['current_a']}A 通电 "
+                f"{DRILL_DEMO_ON_SECONDS:.1f}s 后自动断电；请确认电钻已固定、周围无人",
+                needs_confirm=True,
+                confirm_kind="power_on",
+                profile=profile,
+            )
+        power.output_off()
+        time.sleep(0.1)
+        power.set_voltage_v(profile["voltage_v"])
+        time.sleep(0.05)
+        power.set_current_a(profile["current_a"])
+        time.sleep(0.05)
+        _device_manager_state["current_profile_key"] = "3"
+        _device_manager_state["current_device"] = profile["name"]
+        try:
+            power.output_on()
+            time.sleep(DRILL_DEMO_ON_SECONDS)
+        finally:
+            power.output_off()
+            _device_manager_state["current_profile_key"] = None
+            _device_manager_state["current_device"] = None
+        return _ok(f"电钻点动完成：通电 {DRILL_DEMO_ON_SECONDS:.1f}s 后已关闭输出")
 
     @classmethod
     def _ensure_device(cls, power: CL200WPowerSupply, device_name: str, auto_switch: bool) -> Optional[dict]:
@@ -733,7 +773,8 @@ class MotorPowerBus:
     _EE_ACTIONS = frozenset({
         "bus_monitor",
         "power_set_voltage", "power_set_current", "power_output_on", "power_output_off", "power_status",
-        "device_switch_hand", "device_switch_gripper",
+        "device_switch_hand", "device_switch_gripper", "device_switch_drill",
+        "drill_pulse",
         "gripper_open", "gripper_close", "gripper_demo",
     })
 
@@ -833,6 +874,8 @@ class MotorPowerBus:
 
                 if action == "power_output_off":
                     power.output_off()
+                    _device_manager_state["current_profile_key"] = None
+                    _device_manager_state["current_device"] = None
                     return _ok("电源输出已关闭", ee_port=port)
 
                 if action == "power_status":
@@ -864,6 +907,23 @@ class MotorPowerBus:
                             profile=DEVICE_PROFILES["2"],
                         )
                     out = cls._switch_device(power, "2", True)
+                    out["ee_port"] = port
+                    return out
+
+                if action == "device_switch_drill":
+                    if not confirm_power_on:
+                        return _fail(
+                            "电钻接通电源后会立即转动；请确认电钻已固定、周围无人后再打开电源",
+                            needs_confirm=True,
+                            confirm_kind="power_on",
+                            profile=DEVICE_PROFILES["3"],
+                        )
+                    out = cls._switch_device(power, "3", True)
+                    out["ee_port"] = port
+                    return out
+
+                if action == "drill_pulse":
+                    out = cls._drill_pulse(power, confirm_power_on)
                     out["ee_port"] = port
                     return out
 

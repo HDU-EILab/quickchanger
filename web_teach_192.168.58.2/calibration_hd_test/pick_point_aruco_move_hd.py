@@ -47,6 +47,7 @@ class ArucoResult:
     center_uv: tuple[float, float] | None = None
     corners: np.ndarray | None = None
     marker_id: int | None = None
+    seen_ids: tuple[int, ...] = ()
     perimeter_px: float = 0.0
     rejected_count: int = 0
 
@@ -136,12 +137,14 @@ def detect_aruco_center(
 
     best: ArucoResult | None = None
     total_rejected = 0
+    seen_ids: set[int] = set()
     for variant_name, img in preprocess_variants(bgr):
         corners_list, ids, rejected = detect_with_image(img, dictionary, detector, params)
         total_rejected += 0 if rejected is None else len(rejected)
         if ids is None or len(corners_list) == 0:
             continue
         for corners, mid in zip(corners_list, ids.reshape(-1).astype(int)):
+            seen_ids.add(int(mid))
             if int(mid) != int(marker_id):
                 continue
             pts = corners.reshape(4, 2).astype(np.float64)
@@ -153,6 +156,7 @@ def detect_aruco_center(
                 center_uv=(float(center[0]), float(center[1])),
                 corners=pts,
                 marker_id=int(mid),
+                seen_ids=tuple(sorted(seen_ids)),
                 perimeter_px=perim,
                 rejected_count=total_rejected,
             )
@@ -161,10 +165,14 @@ def detect_aruco_center(
 
     if best is not None:
         best.rejected_count = total_rejected
+        best.seen_ids = tuple(sorted(seen_ids))
         return best
+    seen = tuple(sorted(seen_ids))
+    detail = f"；本帧仅看到其它 id={list(seen)}" if seen else ""
     return ArucoResult(
         ok=False,
-        message=f"未检测到 dictionary={dictionary_name} id={marker_id}",
+        message=f"未检测到 dictionary={dictionary_name} id={marker_id}{detail}",
+        seen_ids=seen,
         rejected_count=total_rejected,
     )
 

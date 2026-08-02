@@ -542,11 +542,12 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
 
         last_miss_log = -999
         while True:
+            scan_move_finished = False
             if args.dry_run:
                 if time.monotonic() >= dry_end:
-                    break
+                    scan_move_finished = True
             elif proc is not None and proc.poll() is not None:
-                break
+                scan_move_finished = True
 
             loop_t0 = time.monotonic()
             frame_idx += 1
@@ -568,14 +569,22 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
                 continue
             detected = bool(result.ok and result.center_uv is not None)
             ok_for_score = detected and score >= float(args.min_perimeter_px)
+            seen_ids = getattr(result, "seen_ids", ()) or ()
+            other_ids = [int(x) for x in seen_ids if int(x) != int(args.aruco_id)]
+            other_id_ends_window = bool(best is not None and seen_once and other_ids)
             if detected:
                 detected_frames += 1
-            if ok_for_score:
+            if ok_for_score and not other_id_ends_window:
                 valid_frames += 1
 
-            if detected:
-                seen_once = True
-                lost_after_seen = 0
+            if other_id_ends_window:
+                lost_after_seen = max(lost_after_seen, int(args.lost_after_visible))
+                print(
+                    "[SMOOTH] 已进入其它 ArUco 编号区域，立即结束目标窗口："
+                    f"target_id={args.aruco_id}, other_ids={other_ids}, "
+                    f"seen_ids={list(seen_ids)}"
+                )
+            elif detected:
                 u, v = result.center_uv
                 rs_frame_no = getattr(cam, "last_frame_number", None)
                 print(
@@ -587,6 +596,8 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
                     f"frame_latency={frame_latency_ms:.1f}ms"
                 )
                 if ok_for_score:
+                    seen_once = True
+                    lost_after_seen = 0
                     match = {
                         "score": score,
                         "pose": tcp_pose[:6],
@@ -618,12 +629,19 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
                         f"[SMOOTH] 已识别但低于评分阈值 "
                         f"({score:.1f} < {args.min_perimeter_px:.1f})"
                     )
+                    if seen_once:
+                        lost_after_seen += 1
+                        print(
+                            f"[SMOOTH] 目标未达有效阈值，按丢失计数 "
+                            f"{lost_after_seen}/{args.lost_after_visible}"
+                        )
             else:
                 if seen_once:
                     lost_after_seen += 1
+                    extra = f"，本帧看到其它 id={list(seen_ids)}" if seen_ids else ""
                     print(
                         f"[SMOOTH] 首次识别后未检测到目标 "
-                        f"{lost_after_seen}/{args.lost_after_visible}"
+                        f"{lost_after_seen}/{args.lost_after_visible}{extra}"
                     )
                 elif frame_idx == 1 or frame_idx - last_miss_log >= max(1, int(args.smooth_sample_hz)):
                     print(f"[SMOOTH] 尚未检测到目标 ArUco frame={frame_idx}")
@@ -639,6 +657,10 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
                 triggered = True
                 if not args.dry_run and bool(args.smooth_stop_on_lost):
                     stop_motion_light(args.host)
+                break
+
+            if scan_move_finished:
+                print("[SMOOTH] 连续扫描 MoveL 已到终点，结束采样循环")
                 break
 
             now = time.monotonic()

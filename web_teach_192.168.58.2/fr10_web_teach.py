@@ -567,6 +567,8 @@ def _fr10_request(action: str, payload: dict) -> dict:
         "power_status",
         "device_switch_hand",
         "device_switch_gripper",
+        "device_switch_drill",
+        "drill_pulse",
         "gripper_open",
         "gripper_close",
         "gripper_demo",
@@ -945,6 +947,10 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
     <button class="btn btn-motor-r" onclick="deviceSwitch('gripper')">切换夹爪 24V</button>
   </div>
   <div class="row2">
+    <button class="btn btn-motor-r" onclick="deviceSwitch('drill')">切换电钻 20V</button>
+    <button class="btn btn-motor-f" onclick="drillPulse()">电钻点动 1s</button>
+  </div>
+  <div class="row2">
     <button class="btn btn-motor-f" onclick="powerAction('status')">电源状态</button>
     <button class="btn btn-motor-s" onclick="powerAction('off')">关闭输出</button>
   </div>
@@ -1173,11 +1179,16 @@ function sendEeAction(action,label,extra,opt){
 function deviceSwitch(kind){
   if(kind==='hand') sendEeAction('device_switch_hand','切换灵巧手 8.4V',{});
   else if(kind==='gripper') sendEeAction('device_switch_gripper','切换夹爪 24V',{});
+  else if(kind==='drill') sendEeAction('device_switch_drill','切换电钻 20V',{});
 }
 
 function powerAction(kind){
   if(kind==='status') sendEeAction('power_status','电源状态',{});
   else if(kind==='off') sendEeAction('power_output_off','关闭电源输出',{});
+}
+
+function drillPulse(){
+  sendEeAction('drill_pulse','电钻点动 1s',{});
 }
 
 function busMonitor(){

@@ -8,8 +8,8 @@
 
 - FR10 网页示教器：读取 TCP、MoveL 位姿移动、相对移出/移入、回 home。
 - Quickchanger ArUco 自动定位：识别 ArUco 4x4 marker，默认 ID 为 `1`。
-- Smooth 演示流程：机械臂连续平滑扫描，扫描中检测 ArUco，回到最佳视角后执行两阶段对接移动。
-- 外设控制：快换电机正反转/停止/状态/诊断、末端供电切换、HEPG 夹爪、RH56 灵巧手。
+- Smooth 演示流程：机械臂连续平滑扫描，扫描中检测指定 ArUco 编号，多编号场景下只锁定当前流程目标编号，回到目标窗口中间视角后执行两阶段对接移动。
+- 外设控制：快换电机正反转/停止/状态/诊断、末端供电切换、HEPG 夹爪、RH56 灵巧手、电钻 20V 供电档案与 1s 点动。
 - 标定支持：包含当前 active 手眼标定矩阵、RealSense 内参和现场补偿文件。
 
 ## 目录结构
@@ -87,7 +87,7 @@ web_teach_192.168.58.2/calibration_hd_test/quickchanger_config.json
 当前交付默认值：
 
 ```text
-smooth_scan_vel = 30.0
+smooth_scan_vel = 35.0
 lost_after_visible = 2
 smooth_scan_detect_scale = 0.5
 smooth_frame_time_offset_s = 0.12
@@ -97,7 +97,7 @@ stage2_deadzone_mm = [-2.0, -2.0, -3.0]
 
 说明：
 
-- `smooth_scan_vel`：smooth 连续扫描 MoveL 速度百分比。
+- `smooth_scan_vel`：smooth 连续扫描 MoveL 速度百分比，当前版本临时提高到 `35.0` 以测试更快响应下的稳定性。
 - `lost_after_visible`：首次识别后连续多少帧未识别即结束扫描。
 - `smooth_scan_detect_scale`：扫描阶段 ArUco 检测缩放比例，`0.5` 表示半分辨率检测后映射回原图。
 - `smooth_frame_time_offset_s`：图像帧和 TCP 位姿匹配的时间补偿。

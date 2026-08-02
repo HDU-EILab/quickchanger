@@ -1,15 +1,37 @@
 {
-  "stage1_deadzone_mm": [-2.0, -2.0, 37.0],
-  "stage2_deadzone_mm": [-2.0, -2.0, -3.0],
+  "stage1_deadzone_mm": [
+    -2.0,
+    -2.0,
+    37.0
+  ],
+  "stage2_deadzone_mm": [
+    -2.0,
+    -2.0,
+    -3.0
+  ],
   "quickchanger_move_vel": 25.0,
-  "demo_start": [-769.0, -82.0, 1118.0, -159.0, 16.0, 45.0],
-  "demo_end": [-769.0, 487.0, 1118.0, -159.0, 16.0, 45.0],
+  "demo_start": [
+    -769.0,
+    -82.0,
+    1118.0,
+    -159.0,
+    16.0,
+    45.0
+  ],
+  "demo_end": [
+    -769.0,
+    487.0,
+    1118.0,
+    -159.0,
+    16.0,
+    45.0
+  ],
   "lost_after_visible": 2,
   "scan_steps": 56,
   "demo_scan_vel": 35.0,
   "demo_settle_s": 0.02,
   "min_perimeter_px": 120.0,
-  "smooth_scan_vel": 30.0,
+  "smooth_scan_vel": 35.0,
   "smooth_sample_hz": 30.0,
   "smooth_stop_on_lost": true,
   "smooth_pose_sync_mode": "buffer",
@@ -27,7 +49,7 @@
     "demo_scan_vel": "run_quickchanger_demo 分段扫描 MoveL 速度百分比。建议 10-60。",
     "demo_settle_s": "run_quickchanger_demo 每个分段点到位后等待相机稳定时间，单位秒。建议 0-0.1；越小越快。",
     "min_perimeter_px": "ArUco 参与最佳视角评分的最小周长阈值，单位像素。建议 80-200；太小容易接受远处/误检目标。",
-    "smooth_scan_vel": "run_quickchanger_smooth 连续扫描 MoveL 速度百分比。建议 20-80；越大扫描越快。",
+    "smooth_scan_vel": "run_quickchanger_smooth 连续扫描 MoveL 速度百分比。建议 20-80；越大扫描越快。当前 35.0 是临时稳定性测试值。",
     "smooth_sample_hz": "run_quickchanger_smooth 连续移动时 ArUco 检测采样频率，单位 Hz。建议 12-30；高速扫描时建议接近相机帧率 30。",
     "smooth_stop_on_lost": "run_quickchanger_smooth 在连续丢失目标后是否调用 StopMotion 提前停止扫描。true 更快进入定位；false 会等待扫描 MoveL 到终点。",
     "smooth_pose_sync_mode": "run_quickchanger_smooth 图像帧与机械臂 TCP 位姿同步方式。buffer 表示后台高频采 TCP 并按图像时间插值，适合高速扫描且不阻塞识别；bracket 表示取图前后各读一次 TCP；after 为旧逻辑。建议 buffer。",

@@ -27,6 +27,7 @@ http://<Jetson IP>:8890
 - 执行 `#home`。
 - 快换电机控制：正转、反转、停止、状态、锁紧诊断、复位诊断。
 - 末端电源控制：切换灵巧手 8.4V、切换夹爪 24V、关闭输出、电源状态、末端监测。
+- 末端电钻工具：切换电钻 20V 供电档案、电钻点动 1s，并在上电前进行确认。
 - HEPG 夹爪打开/闭合。
 - RH56 灵巧手抓紧/打开。
 - 从网页触发 Quickchanger 平滑演示流程，并指定 ArUco ID。
@@ -67,6 +68,7 @@ Quickchanger 支持：
 
 - 默认识别 ArUco `DICT_4X4_50`、ID `1`。
 - 支持通过参数指定不同 ArUco ID。
+- 支持多编号演示场景：同一流程只追踪指定 ID，出现其它 ID 时立即结束目标窗口，并从目标窗口内有效匹配序列取中间视角。
 - 支持窗口模式与 headless 模式。
 - RealSense HD 取流。
 - 自动检测 ArUco 中心点。
@@ -122,7 +124,7 @@ web_teach_192.168.58.2/calibration_hd_test/quickchanger_config.json
 其中包含两阶段 deadzone、演示扫描起点/终点、失配次数、扫描分段数、平滑扫描速度、平滑扫描检测缩放比例等现场参数。当前交付默认值：
 
 ```text
-smooth_scan_vel = 30.0
+smooth_scan_vel = 35.0
 lost_after_visible = 2
 smooth_scan_detect_scale = 0.5
 smooth_frame_time_offset_s = 0.12
