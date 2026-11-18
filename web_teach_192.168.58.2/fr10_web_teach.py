@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import xmlrpc.client
 from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,10 +51,15 @@ FR10_REALTIME_PORT = 20004
 RPC_RECONNECT_PAUSE_S = 0.35
 DEFAULT_TOOL = 0
 DEFAULT_USER = 0
-DEFAULT_VEL = 10.0
+DEFAULT_VEL = 20.0
 DEFAULT_OVL = 100.0
+DEMO_START_POSE = [-505.0, 265.0, 934.0, 91.0, -13.0, -2.0]
+DEMO_X_EXIT_MM = 240.0
+POST_DEMO_MOTOR_FORWARD_PRE_Z_MM = 3.0
+POST_DEMO_MOTOR_FORWARD_AFTER_X_MM = 3.0
 QUICKCHANGER_DIR = "/home/nvidia/FR10_web_teach_release/web_teach_192.168.58.2/calibration_hd_test"
 QUICKCHANGER_SCRIPT = "quickchanger_smooth_sweep_hd.py"
+QUICKCHANGER_EXPERIENCE_FILE = "quickchanger_experience_positions.json"
 QUICKCHANGER_CONDA_SH = "/home/nvidia/miniconda3/etc/profile.d/conda.sh"
 QUICKCHANGER_CONDA_ENV = "rmc-yolo"
 QUICKCHANGER_FR10_SITE = "/home/nvidia/miniconda3/envs/fr10-fairino/lib/python3.10/site-packages"
@@ -81,6 +87,14 @@ _deferred_pre: str | None = None  # None | "A" | "B" | "C"
 # 运动用长连接：避免 get_pose 轮询反复 RPC()/CloseRPC 占死 20004
 _rpc_rob = None
 _rpc_mod = None
+_demo_return_pose: list[float] | None = None
+_motor_forward_z_nudge_pending = False
+_current_tool_hint: str | None = None
+_quickchanger_jobs_lock = threading.Lock()
+_quickchanger_jobs: dict[str, dict] = {}
+_quickchanger_job_seq = 0
+_QUICKCHANGER_JOB_KEEP = 20
+_QUICKCHANGER_JOB_DIR = "/tmp/fr10_quickchanger_jobs"
 
 # 电机串口控制（来源于 motor_control.py 的正反转/停止命令）
 MOTOR_DEFAULT_PORT = "/dev/ttyUSB0"
@@ -403,6 +417,144 @@ def _move_tcp_delta(rob, payload: dict, delta_xyz: tuple[float, float, float], l
     }
 
 
+def _move_tcp_absolute(rob, payload: dict, pose: list[float], label: str, sdk: str) -> dict:
+    mp, err = _parse_motion_params(payload)
+    if err:
+        return {"ok": False, "msg": err, "sdk": sdk}
+    assert mp is not None
+    target = [float(x) for x in pose[:6]]
+    ret = rob.MoveL(
+        desc_pos=target,
+        tool=mp["tool"],
+        user=mp["user"],
+        vel=mp["vel"],
+        ovl=mp["ovl"],
+    )
+    ok = _movej_ok(ret)
+    return {
+        "ok": bool(ok),
+        "msg": f"{label} MoveL => {ret}",
+        "pose_target": target,
+        "ret": ret if isinstance(ret, (int, float, str, list, dict)) else str(ret),
+        "sdk": sdk,
+    }
+
+
+def _demo_begin(rob, payload: dict, sdk: str) -> dict:
+    global _demo_return_pose
+    pe, pose = _read_tcp_pose_rpc(rob)
+    if pe != 0 or pose is None:
+        return {"ok": False, "msg": f"读取回归位置失败: err={pe}", "sdk": sdk}
+    out = _move_tcp_absolute(rob, payload, DEMO_START_POSE, "演示开始", sdk)
+    if out.get("ok"):
+        _demo_return_pose = [float(x) for x in pose[:6]]
+        out["return_pose"] = _demo_return_pose
+        out["msg"] = (
+            f"已记录回归位置 {[round(x, 2) for x in _demo_return_pose]}；"
+            + str(out.get("msg", ""))
+        )
+    return out
+
+
+def _demo_end(rob, payload: dict, sdk: str) -> dict:
+    global _demo_return_pose
+    if _demo_return_pose is None:
+        return {"ok": True, "msg": "未记录回归位置，演示结束不执行移动", "sdk": sdk}
+    target = list(_demo_return_pose)
+    out = _move_tcp_absolute(rob, payload, target, "演示结束回归", sdk)
+    if out.get("ok"):
+        _demo_return_pose = None
+        out["msg"] = "已回到回归位置，并已释放回归位置记录；" + str(out.get("msg", ""))
+    return out
+
+
+def _mark_demo_flow_finished() -> None:
+    global _motor_forward_z_nudge_pending
+    _motor_forward_z_nudge_pending = True
+
+
+def _motor_forward_with_post_demo_nudge(payload: dict) -> dict:
+    global _motor_forward_z_nudge_pending
+    pre_nudge_result = None
+    after_nudge_result = None
+    with _arm_lock:
+        if _motor_forward_z_nudge_pending:
+            try:
+                rob = _rpc_ensure(force=False)
+                sdk = rob.GetSDKVersion()
+                pre_nudge_result = _move_tcp_delta(
+                    rob,
+                    payload,
+                    (0.0, 0.0, POST_DEMO_MOTOR_FORWARD_PRE_Z_MM),
+                    f"演示后首次电机正转前 Z+={POST_DEMO_MOTOR_FORWARD_PRE_Z_MM:g}",
+                    sdk,
+                )
+            except Exception as e:
+                try:
+                    _rpc_close_unlocked()
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "msg": f"电机正转前 Z+={POST_DEMO_MOTOR_FORWARD_PRE_Z_MM:g}mm 失败: {e}",
+                }
+            if not pre_nudge_result.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": f"电机正转前 Z+={POST_DEMO_MOTOR_FORWARD_PRE_Z_MM:g}mm 失败，未执行电机正转: "
+                    + str(pre_nudge_result.get("msg", "")),
+                    "pre_nudge_result": pre_nudge_result,
+                }
+            _motor_forward_z_nudge_pending = False
+
+    try:
+        out = _bus_import().handle_action("motor_forward", payload)
+    except Exception as e:
+        return {"ok": False, "msg": f"RS485 总线模块执行失败: {e}"}
+    if out.get("ok") and pre_nudge_result is not None:
+        with _arm_lock:
+            try:
+                rob = _rpc_ensure(force=False)
+                sdk = rob.GetSDKVersion()
+                after_nudge_result = _move_tcp_delta(
+                    rob,
+                    payload,
+                    (POST_DEMO_MOTOR_FORWARD_AFTER_X_MM, 0.0, 0.0),
+                    f"演示后首次电机正转完成后 X+={POST_DEMO_MOTOR_FORWARD_AFTER_X_MM:g}",
+                    sdk,
+                )
+            except Exception as e:
+                try:
+                    _rpc_close_unlocked()
+                except Exception:
+                    pass
+                after_nudge_result = {
+                    "ok": False,
+                    "msg": f"电机正转完成后 X+={POST_DEMO_MOTOR_FORWARD_AFTER_X_MM:g}mm 失败: {e}",
+                }
+        out["after_nudge_result"] = after_nudge_result
+        if not after_nudge_result.get("ok"):
+            out["ok"] = False
+            out["msg"] = (
+                "电机正转已执行成功，但随后 "
+                f"X+={POST_DEMO_MOTOR_FORWARD_AFTER_X_MM:g}mm 失败: "
+                + str(after_nudge_result.get("msg", ""))
+            )
+            return out
+    if pre_nudge_result is not None:
+        out["pre_nudge_result"] = pre_nudge_result
+        out["msg"] = (
+            f"已先执行演示后首次正转 Z+={POST_DEMO_MOTOR_FORWARD_PRE_Z_MM:g}mm；"
+            + str(out.get("msg", ""))
+        )
+    if after_nudge_result is not None:
+        out["msg"] = (
+            str(out.get("msg", ""))
+            + f"；正转成功后已执行 X+={POST_DEMO_MOTOR_FORWARD_AFTER_X_MM:g}mm"
+        )
+    return out
+
+
 def _quickchanger_demo_cmd(aruco_id: int) -> str:
     return (
         f"cd {QUICKCHANGER_DIR!r} && "
@@ -411,6 +563,128 @@ def _quickchanger_demo_cmd(aruco_id: int) -> str:
         f"export PYTHONPATH={QUICKCHANGER_FR10_SITE!r}:${{PYTHONPATH:-}} && "
         f"python {QUICKCHANGER_SCRIPT!r} --profile hd --headless --aruco-id {int(aruco_id)}"
     )
+
+
+QUICKCHANGER_TOOL_PRESETS = {
+    1: ("灵巧手", "device_switch_hand"),
+    2: ("夹爪", "device_switch_gripper"),
+    3: ("电钻", "device_switch_drill"),
+}
+
+
+def _set_current_tool_hint(tool_name: str | None) -> None:
+    global _current_tool_hint
+    if tool_name in ("灵巧手", "夹爪", "电钻"):
+        _current_tool_hint = tool_name
+    elif tool_name is None:
+        _current_tool_hint = None
+
+
+def _quickchanger_auto_power(aruco_id: int, payload: dict) -> dict:
+    if int(aruco_id) == 3:
+        _set_current_tool_hint(None)
+        return {
+            "ok": True,
+            "msg": "电钻 ID3 按配置跳过到位后的自动供电切换",
+            "tool_name": "电钻",
+            "skipped": True,
+        }
+    preset = QUICKCHANGER_TOOL_PRESETS.get(int(aruco_id))
+    if preset is None:
+        return {"ok": False, "msg": f"ArUco ID {aruco_id} 未配置自动供电档案"}
+    tool_name, action = preset
+    power_payload = dict(payload)
+    power_payload["confirm_power_on"] = True
+    try:
+        out = _bus_import().handle_action("power_status", power_payload)
+    except Exception as e:
+        return {"ok": False, "msg": f"{tool_name}供电检查失败: {e}", "tool_name": tool_name}
+    if not out.get("ok"):
+        return {"ok": False, "msg": f"{tool_name}供电检查失败: {out.get('msg', '')}", "tool_name": tool_name, "power_status": out}
+    try:
+        switched = _bus_import().handle_action(action, power_payload)
+    except Exception as e:
+        return {"ok": False, "msg": f"{tool_name}供电切换失败: {e}", "tool_name": tool_name, "power_status": out}
+    switched["tool_name"] = tool_name
+    switched["power_checked"] = out
+    switched["msg"] = f"已完成 Quickchanger，并已自动切换到{tool_name}供电。{switched.get('msg', '')}"
+    if switched.get("ok"):
+        _set_current_tool_hint(tool_name)
+    return switched
+
+
+def _quickchanger_prepare_power(aruco_id: int, payload: dict) -> dict | None:
+    if int(aruco_id) != 3:
+        return None
+    _set_current_tool_hint(None)
+    power_payload = dict(payload)
+    try:
+        off = _bus_import().handle_action("power_output_off", power_payload)
+    except Exception as e:
+        return {"ok": False, "msg": f"电钻 ID3 执行前关闭电源输出失败: {e}", "tool_name": "电钻"}
+    if not off.get("ok"):
+        return {
+            "ok": False,
+            "msg": f"电钻 ID3 执行前关闭电源输出失败: {off.get('msg', '')}",
+            "tool_name": "电钻",
+            "power_off_result": off,
+        }
+    time.sleep(0.5)
+    return {
+        "ok": True,
+        "msg": f"电钻 ID3 执行前已关闭电源输出。{off.get('msg', '')}",
+        "tool_name": "电钻",
+        "power_off_result": off,
+    }
+
+
+def _clear_quickchanger_experience(payload: dict) -> dict:
+    try:
+        aruco_id = int(payload.get("aruco_id", 1))
+    except Exception:
+        return {"ok": False, "msg": "aruco_id 必须是整数"}
+    if aruco_id < 0:
+        return {"ok": False, "msg": "aruco_id 不能为负数"}
+
+    path = os.path.join(QUICKCHANGER_DIR, QUICKCHANGER_EXPERIENCE_FILE)
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        else:
+            data = {}
+    except Exception as e:
+        return {"ok": False, "msg": f"读取经验位文件失败: {e}", "path": path, "aruco_id": aruco_id}
+
+    key = str(aruco_id)
+    removed = data.pop(key, None)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception as e:
+        return {"ok": False, "msg": f"写入经验位文件失败: {e}", "path": path, "aruco_id": aruco_id}
+
+    if removed is None:
+        msg = f"ArUco ID{aruco_id} 当前没有经验位置"
+    else:
+        msg = f"已清除 ArUco ID{aruco_id} 经验位置"
+    return {
+        "ok": True,
+        "msg": msg,
+        "aruco_id": aruco_id,
+        "removed": removed,
+        "path": path,
+        "remaining_ids": sorted(
+            data.keys(),
+            key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)),
+        ),
+    }
 
 
 def _run_quickchanger_demo(payload: dict) -> dict:
@@ -422,6 +696,14 @@ def _run_quickchanger_demo(payload: dict) -> dict:
         return {"ok": False, "msg": "aruco_id 不能为负数"}
     with _arm_lock:
         _rpc_close_unlocked()
+        prepare_power_result = _quickchanger_prepare_power(aruco_id, payload)
+        if prepare_power_result is not None and not prepare_power_result.get("ok"):
+            return {
+                "ok": False,
+                "msg": prepare_power_result.get("msg", "quickchanger 执行前供电准备失败"),
+                "aruco_id": aruco_id,
+                "prepare_power_result": prepare_power_result,
+            }
         cmd = _quickchanger_demo_cmd(aruco_id)
         try:
             proc = subprocess.run(
@@ -446,12 +728,176 @@ def _run_quickchanger_demo(payload: dict) -> dict:
             }
         out = proc.stdout or ""
         tail = "\n".join(out.splitlines()[-18:])
+        if prepare_power_result is not None:
+            tail = "\n".join(
+                x
+                for x in (
+                    f"[PRE_POWER] {prepare_power_result.get('msg', '')}",
+                    tail,
+                )
+                if x
+            )
+        auto_power = payload.get("auto_power") in (True, 1, "1", "true", "yes", "y")
+        power_result = None
+        if proc.returncode == 0 and auto_power:
+            power_result = _quickchanger_auto_power(aruco_id, payload)
+            tail = "\n".join(
+                x for x in (tail, f"[AUTO_POWER] {power_result.get('msg', '')}") if x
+            )
+            if not power_result.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": f"quickchanger demo id={aruco_id} return=0，但自动供电失败\n{tail}",
+                    "returncode": proc.returncode,
+                    "aruco_id": aruco_id,
+                    "power_result": power_result,
+                }
+        msg_head = f"quickchanger demo id={aruco_id} return={proc.returncode}"
+        if proc.returncode == 0 and power_result and power_result.get("ok"):
+            msg_head = power_result.get("msg", msg_head)
+        _mark_demo_flow_finished()
         return {
             "ok": proc.returncode == 0,
-            "msg": f"quickchanger demo id={aruco_id} return={proc.returncode}\n{tail}",
+            "msg": f"{msg_head}\n{tail}",
             "returncode": proc.returncode,
             "aruco_id": aruco_id,
+            "power_result": power_result,
         }
+
+
+def _quickchanger_job_snapshot(job_id: str) -> dict | None:
+    with _quickchanger_jobs_lock:
+        job = _quickchanger_jobs.get(job_id)
+        return dict(job) if job else None
+
+
+def _quickchanger_job_path(job_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in job_id)
+    return os.path.join(_QUICKCHANGER_JOB_DIR, safe + ".json")
+
+
+def _quickchanger_job_write(job: dict) -> None:
+    job_id = str(job.get("job_id", "")).strip()
+    if not job_id:
+        return
+    try:
+        os.makedirs(_QUICKCHANGER_JOB_DIR, exist_ok=True)
+        tmp = _quickchanger_job_path(job_id) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
+        os.replace(tmp, _quickchanger_job_path(job_id))
+    except Exception as exc:
+        print(f"[WARN] quickchanger job 状态写入失败: {exc}", flush=True)
+
+
+def _quickchanger_job_read(job_id: str) -> dict | None:
+    try:
+        with open(_quickchanger_job_path(job_id), "r", encoding="utf-8") as f:
+            job = json.load(f)
+        return job if isinstance(job, dict) else None
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        print(f"[WARN] quickchanger job 状态读取失败: {exc}", flush=True)
+        return None
+
+
+def _quickchanger_job_prune_unlocked() -> None:
+    if len(_quickchanger_jobs) <= _QUICKCHANGER_JOB_KEEP:
+        return
+    done_items = [
+        (job.get("finished_at", job.get("started_at", 0.0)), job_id)
+        for job_id, job in _quickchanger_jobs.items()
+        if job.get("done")
+    ]
+    for _, job_id in sorted(done_items)[: max(0, len(_quickchanger_jobs) - _QUICKCHANGER_JOB_KEEP)]:
+        _quickchanger_jobs.pop(job_id, None)
+
+
+def _quickchanger_job_worker(job_id: str, payload: dict) -> None:
+    with _quickchanger_jobs_lock:
+        job = _quickchanger_jobs.get(job_id)
+        if job:
+            job["status"] = "running"
+            job["msg"] = "quickchanger smooth 扫描执行中..."
+            _quickchanger_job_write(dict(job))
+    try:
+        result = _run_quickchanger_demo(payload)
+    except Exception as e:
+        result = {"ok": False, "msg": f"quickchanger 后台任务异常: {e}"}
+    with _quickchanger_jobs_lock:
+        job = _quickchanger_jobs.get(job_id)
+        if job:
+            job["status"] = "done"
+            job["done"] = True
+            job["finished_at"] = time.time()
+            job["result"] = result
+            job["ok"] = bool(result.get("ok"))
+            job["msg"] = result.get("msg", "")
+            _quickchanger_job_write(dict(job))
+            _quickchanger_job_prune_unlocked()
+
+
+def _start_quickchanger_job(payload: dict) -> dict:
+    global _quickchanger_job_seq
+    try:
+        aruco_id = int(payload.get("aruco_id", 1))
+    except Exception:
+        return {"ok": False, "msg": "aruco_id 必须是整数"}
+    if aruco_id < 0:
+        return {"ok": False, "msg": "aruco_id 不能为负数"}
+    job_payload = dict(payload)
+    job_payload["aruco_id"] = aruco_id
+    requested_job_id = str(payload.get("job_id", "")).strip()
+    with _quickchanger_jobs_lock:
+        if requested_job_id and requested_job_id in _quickchanger_jobs:
+            job = _quickchanger_jobs[requested_job_id]
+            return {
+                "ok": True,
+                "job_id": requested_job_id,
+                "aruco_id": job.get("aruco_id", aruco_id),
+                "done": bool(job.get("done")),
+                "status": job.get("status", ""),
+                "msg": "quickchanger 后台任务已存在",
+            }
+        _quickchanger_job_seq += 1
+        job_id = requested_job_id or f"qc-{int(time.time() * 1000)}-{_quickchanger_job_seq}"
+        _quickchanger_jobs[job_id] = {
+            "ok": True,
+            "job_id": job_id,
+            "aruco_id": aruco_id,
+            "status": "pending",
+            "done": False,
+            "started_at": time.time(),
+            "msg": "quickchanger 后台任务已创建",
+        }
+        _quickchanger_job_write(dict(_quickchanger_jobs[job_id]))
+    th = threading.Thread(
+        target=_quickchanger_job_worker,
+        args=(job_id, job_payload),
+        daemon=True,
+    )
+    th.start()
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "aruco_id": aruco_id,
+        "done": False,
+        "msg": "quickchanger 后台任务已启动",
+    }
+
+
+def _get_quickchanger_job(payload: dict) -> dict:
+    job_id = str(payload.get("job_id", "")).strip()
+    if not job_id:
+        return {"ok": False, "msg": "缺少 job_id"}
+    job = _quickchanger_job_snapshot(job_id)
+    if not job:
+        job = _quickchanger_job_read(job_id)
+    if not job:
+        return {"ok": False, "msg": f"找不到 quickchanger 任务: {job_id}", "job_id": job_id}
+    job["ok"] = True
+    return job
 
 
 def _truthy_confirm_gripper(payload: dict) -> bool:
@@ -549,11 +995,84 @@ def _rh56_cmd(mode: str, payload: dict) -> dict:
             return {"ok": False, "msg": f"RH56 串口执行失败: {e}", "rh56_port": port}
 
 
+def _infer_current_tool(payload: dict) -> dict:
+    hinted = str(payload.get("tool_hint") or payload.get("current_tool") or "").strip()
+    if hinted in ("灵巧手", "夹爪", "电钻"):
+        return {"ok": True, "tool": hinted, "source": "payload_hint"}
+    if _current_tool_hint in ("灵巧手", "夹爪", "电钻"):
+        return {"ok": True, "tool": _current_tool_hint, "source": "server_hint"}
+
+    try:
+        out = _bus_import().handle_action("power_status", payload)
+    except Exception as e:
+        return {"ok": False, "msg": f"读取末端供电状态失败: {e}"}
+    if not out.get("ok"):
+        return {"ok": False, "msg": f"读取末端供电状态失败: {out.get('msg', '')}", "power_status": out}
+
+    current_device = str(out.get("current_device") or "").strip()
+    if current_device in ("灵巧手", "夹爪", "电钻"):
+        return {"ok": True, "tool": current_device, "source": "device_state", "power_status": out}
+
+    ps = out.get("power_status") if isinstance(out.get("power_status"), dict) else {}
+    output_on = ps.get("output_setting") == 1
+    voltage = ps.get("realtime_voltage_v")
+    try:
+        voltage_f = float(voltage)
+    except Exception:
+        voltage_f = None
+    if not output_on or voltage_f is None:
+        return {
+            "ok": False,
+            "msg": "无法判断当前末端设备：供电输出未开启或电压未知，请先执行对应设备切换。",
+            "power_status": out,
+        }
+    if 7.0 <= voltage_f <= 10.5:
+        return {"ok": True, "tool": "灵巧手", "source": "voltage", "power_status": out}
+    if 20.5 <= voltage_f <= 26.5:
+        return {"ok": True, "tool": "夹爪", "source": "voltage", "power_status": out}
+    if 17.0 <= voltage_f <= 20.5:
+        return {
+            "ok": False,
+            "msg": f"当前疑似电钻供电 {voltage_f:.2f}V，不执行抓紧/打开动作。",
+            "power_status": out,
+        }
+    return {
+        "ok": False,
+        "msg": f"无法根据当前电压 {voltage_f:.2f}V 判断末端设备，请先切换设备。",
+        "power_status": out,
+    }
+
+
+def _tool_open_close_auto(mode: str, payload: dict) -> dict:
+    if mode not in ("open", "close"):
+        return {"ok": False, "msg": f"unknown tool mode: {mode}"}
+    inferred = _infer_current_tool(payload)
+    if not inferred.get("ok"):
+        return inferred
+
+    tool = inferred.get("tool")
+    if tool == "灵巧手":
+        out = _rh56_cmd("open" if mode == "open" else "grip", payload)
+        out["current_tool"] = tool
+        out["detect_source"] = inferred.get("source")
+        return out
+    if tool == "夹爪":
+        action = "gripper_open" if mode == "open" else "gripper_close"
+        out = _bus_import().handle_action(action, {**payload, "auto_switch_device": True})
+        out["current_tool"] = tool
+        out["detect_source"] = inferred.get("source")
+        return out
+    return {
+        "ok": False,
+        "msg": f"当前设备是{tool}，不支持抓紧/打开自动动作。",
+        "current_tool": tool,
+    }
+
+
 def _fr10_request(action: str, payload: dict) -> dict:
     """位姿走轻量 XML-RPC；运动复用长连接，通道异常时自动重连并重试一次。"""
     global _deferred_pre
     bus_actions = {
-        "motor_forward",
         "motor_reverse",
         "motor_stop",
         "motor_status",
@@ -568,20 +1087,43 @@ def _fr10_request(action: str, payload: dict) -> dict:
         "device_switch_hand",
         "device_switch_gripper",
         "device_switch_drill",
+        "drill_start",
         "drill_pulse",
         "gripper_open",
         "gripper_close",
         "gripper_demo",
     }
+    if action == "motor_forward":
+        return _motor_forward_with_post_demo_nudge(payload)
     if action in bus_actions:
         try:
-            return _bus_import().handle_action(action, payload)
+            out = _bus_import().handle_action(action, payload)
+            if out.get("ok"):
+                if action == "device_switch_hand":
+                    _set_current_tool_hint("灵巧手")
+                elif action == "device_switch_gripper":
+                    _set_current_tool_hint("夹爪")
+                elif action == "device_switch_drill":
+                    _set_current_tool_hint("电钻")
+                elif action in ("power_output_off", "drill_pulse"):
+                    _set_current_tool_hint(None)
+            return out
         except Exception as e:
             return {"ok": False, "msg": f"RS485 总线模块执行失败: {e}"}
     if action == "rh56_grip":
         return _rh56_cmd("grip", payload)
     if action == "rh56_open":
         return _rh56_cmd("open", payload)
+    if action == "tool_close_auto":
+        return _tool_open_close_auto("close", payload)
+    if action == "tool_open_auto":
+        return _tool_open_close_auto("open", payload)
+    if action == "quickchanger_demo_start":
+        return _start_quickchanger_job(payload)
+    if action == "quickchanger_demo_status":
+        return _get_quickchanger_job(payload)
+    if action == "quickchanger_clear_experience":
+        return _clear_quickchanger_experience(payload)
     if action == "quickchanger_demo":
         return _run_quickchanger_demo(payload)
     if action == "get_pose":
@@ -641,10 +1183,16 @@ def _fr10_request(action: str, payload: dict) -> dict:
                     return _move_tcp_delta(rob_cur, payload, (0.0, 0.0, 80.0), "向上移出 Z+=80", sdk_cur)
 
                 if action == "move_tcp_x_plus_80":
-                    return _move_tcp_delta(rob_cur, payload, (80.0, 0.0, 0.0), "向后移出 X+=80", sdk_cur)
+                    return _move_tcp_delta(rob_cur, payload, (DEMO_X_EXIT_MM, 0.0, 0.0), f"向后移出 X+={DEMO_X_EXIT_MM:g}", sdk_cur)
 
                 if action == "move_tcp_x_minus_80":
-                    return _move_tcp_delta(rob_cur, payload, (-80.0, 0.0, 0.0), "向前移入 X-=80", sdk_cur)
+                    return _move_tcp_delta(rob_cur, payload, (-DEMO_X_EXIT_MM, 0.0, 0.0), f"向前移入 X-={DEMO_X_EXIT_MM:g}", sdk_cur)
+
+                if action == "demo_begin":
+                    return _demo_begin(rob_cur, payload, sdk_cur)
+
+                if action == "demo_end":
+                    return _demo_end(rob_cur, payload, sdk_cur)
 
                 if action in (
                     "movej_home",
@@ -861,6 +1409,8 @@ _HTML = r"""<!DOCTYPE html>
 body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:12px 10px}
 h1{font-size:1.2rem;margin-bottom:4px;color:#00d4ff}
 .sub{font-size:.76rem;color:#888;margin-bottom:8px}
+.topbar{width:100%;max-width:420px;display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.topbar h1{margin-bottom:0}
 .box{width:100%;max-width:420px;background:#152238;border:1px solid #2d3f5f;border-radius:10px;padding:10px;margin-bottom:8px}
 .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px}
 label{font-size:.7rem;color:#aaa}
@@ -881,6 +1431,8 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
 .btn-motor-s{background:#c0392b}
 .btn-rh56-g{background:#1a5276}
 .btn-rh56-o{background:#1e8449}
+.btn-mode{background:#34495e;padding:8px 12px;white-space:nowrap}
+.simple-mode .full-only{display:none!important}
 .nudge{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
 .sp{visibility:hidden}
 .btn-n{background:#5b2c6f;padding:8px 0;font-size:.78rem}
@@ -890,8 +1442,11 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
 .pose-live input{width:auto;accent-color:#00d4ff;min-width:1.1rem;min-height:1.1rem}
 </style>
 </head>
-<body>
-<h1>FR10 网页示教器</h1>
+<body class="simple-mode">
+<div class="topbar">
+  <h1>FR10 网页示教器</h1>
+  <button class="btn btn-mode" id="mode_toggle" onclick="toggleUiMode()">完整模式</button>
+</div>
 <div class="sub">TCP MoveL + 关节 step 点（MoveJ），A/B/C 依赖由服务端校验</div>
 
 <div class="box">
@@ -901,22 +1456,42 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
     <button class="btn btn-qc" onclick="moveTcpRelative('z_plus')">向上移出</button>
   </div>
   <div class="row2">
-    <button class="btn btn-qc" onclick="moveTcpRelative('x_plus')">向后移出</button>
-    <button class="btn btn-qc" onclick="moveTcpRelative('x_minus')">向前移入</button>
+    <button class="btn btn-qc" onclick="moveTcpRelative('x_plus')">向后移出 X+240</button>
+    <button class="btn btn-qc" onclick="moveTcpRelative('x_minus')">向前移入 X-240</button>
   </div>
 </div>
 
 <div class="box">
   <div style="font-size:.82rem;color:#f5cba7;margin-bottom:6px">Quickchanger 演示流程</div>
   <div class="row2">
+    <button class="btn btn-demo" onclick="demoSessionAction('begin')">演示开始</button>
+    <button class="btn btn-demo" onclick="demoSessionAction('end')">演示结束</button>
+  </div>
+  <div class="row2 full-only">
     <div><label>ArUco ID</label><input id="qc_aruco_id" type="number" step="1" value="1"></div>
     <button class="btn btn-demo" onclick="runQuickchangerDemo()">执行演示流程</button>
+  </div>
+  <div class="row2">
+    <button class="btn btn-demo" onclick="runQuickchangerPreset(1,'灵巧手')">灵巧手 ID1</button>
+    <button class="btn btn-demo" onclick="runQuickchangerPreset(2,'夹爪')">夹爪 ID2</button>
+  </div>
+  <div class="row2">
+    <button class="btn btn-demo" onclick="runQuickchangerPreset(3,'电钻')">电钻 ID3</button>
+    <div></div>
+  </div>
+  <div class="row2 full-only">
+    <button class="btn btn-qc" onclick="clearQuickchangerExperience(1,'灵巧手')">清除灵巧手经验位置</button>
+    <button class="btn btn-qc" onclick="clearQuickchangerExperience(2,'夹爪')">清除夹爪经验位置</button>
+  </div>
+  <div class="row2 full-only">
+    <button class="btn btn-qc" onclick="clearQuickchangerExperience(3,'电钻')">清除电钻经验位置</button>
+    <div></div>
   </div>
 </div>
 
 <div class="box">
   <div style="font-size:.82rem;color:#f9e79f;margin-bottom:6px">电机控制（串口）</div>
-  <div class="grid">
+  <div class="grid full-only">
     <div><label>电机端口</label><input id="motor_port" type="text" value="/dev/fr10-motor-serial" placeholder="/dev/fr10-motor-serial"></div>
     <div><label>波特率</label><input id="motor_baud" type="number" step="1" value="115200"></div>
     <div><label>超时(s)</label><input id="motor_timeout" type="number" step="0.1" value="0.8"></div>
@@ -925,11 +1500,11 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
     <button class="btn btn-motor-f" onclick="motorAction('forward')">电机正转</button>
     <button class="btn btn-motor-r" onclick="motorAction('reverse')">电机反转</button>
   </div>
-  <div class="row2">
+  <div class="row2 full-only">
     <button class="btn btn-motor-s" onclick="motorAction('stop')">电机停止</button>
     <button class="btn btn-motor-f" onclick="motorAction('status')">电机状态</button>
   </div>
-  <div class="row2">
+  <div class="row2 full-only">
     <button class="btn btn-motor-f" onclick="motorAction('lock_diagnosis')">锁紧诊断</button>
     <button class="btn btn-motor-r" onclick="motorAction('reset_diagnosis')">复位诊断</button>
   </div>
@@ -937,34 +1512,40 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
 
 <div class="box">
   <div style="font-size:.82rem;color:#f9e79f;margin-bottom:6px">末端供电 / 设备切换</div>
-  <div class="grid">
+  <div class="grid full-only">
     <div><label>末端端口</label><input id="ee_port" type="text" value="/dev/fr10-hand-serial" placeholder="/dev/fr10-hand-serial"></div>
     <div><label>波特率</label><input id="ee_baud" type="number" step="1" value="115200"></div>
     <div><label>超时(s)</label><input id="ee_timeout" type="number" step="0.1" value="0.8"></div>
+    <div></div>
   </div>
-  <div class="row2">
+  <div class="row2 full-only">
     <button class="btn btn-motor-f" onclick="deviceSwitch('hand')">切换灵巧手 8.4V</button>
     <button class="btn btn-motor-r" onclick="deviceSwitch('gripper')">切换夹爪 24V</button>
   </div>
   <div class="row2">
-    <button class="btn btn-motor-r" onclick="deviceSwitch('drill')">切换电钻 20V</button>
-    <button class="btn btn-motor-f" onclick="drillPulse()">电钻点动 1s</button>
+    <button class="btn btn-motor-r full-only" onclick="deviceSwitch('drill')">切换电钻 20V</button>
+    <button class="btn btn-motor-f" onclick="drillPulse()">电钻点动</button>
   </div>
   <div class="row2">
-    <button class="btn btn-motor-f" onclick="powerAction('status')">电源状态</button>
+    <button class="btn btn-motor-f full-only" onclick="powerAction('status')">电源状态</button>
     <button class="btn btn-motor-s" onclick="powerAction('off')">关闭输出</button>
   </div>
-  <div class="row2">
+  <div class="row2 full-only">
     <button class="btn btn-motor-f" onclick="busMonitor()">末端监测 10s</button>
     <div></div>
   </div>
+  <div style="font-size:.82rem;color:#d6eaf8;margin-bottom:6px">工具开合（自动判断设备）</div>
   <div class="row2">
+    <button class="btn btn-rh56-o" onclick="toolAction('open')">打开</button>
+    <button class="btn btn-rh56-g" onclick="toolAction('close')">抓紧/闭合</button>
+  </div>
+  <div class="row2 full-only">
     <button class="btn btn-rh56-o" onclick="gripperAction('open')">夹爪打开</button>
     <button class="btn btn-rh56-g" onclick="gripperAction('close')">夹爪闭合</button>
   </div>
 </div>
 
-<div class="box">
+<div class="box full-only">
   <div style="font-size:.82rem;color:#d6eaf8;margin-bottom:6px">RH56 灵巧手（串口）</div>
   <div class="grid">
     <div><label>RH56 端口</label><input id="rh56_port" type="text" value="/dev/fr10-hand-serial" placeholder="/dev/fr10-hand-serial"></div>
@@ -977,7 +1558,7 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
   </div>
 </div>
 
-<div class="box">
+<div class="box full-only">
   <div class="pose-hdr">
     <div style="font-size:.82rem;color:#8dd3ff">位姿（x/y/z=mm，rx/ry/rz=deg）</div>
     <label class="pose-live"><input type="checkbox" id="pose_live_sync" checked>实时同步机械臂</label>
@@ -991,7 +1572,7 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
     <div><label>Rz</label><input id="prz" type="number" step="0.1" value="0"></div>
   </div>
   <div class="grid">
-    <div><label>vel(%)</label><input id="mv" type="number" step="1" value="10"></div>
+    <div><label>vel(%)</label><input id="mv" type="number" step="1" value="20"></div>
     <div><label>ovl(%)</label><input id="ovl" type="number" step="1" value="100"></div>
     <div><label>tool</label><input id="tool" type="number" step="1" value="0"></div>
     <div><label>user</label><input id="user" type="number" step="1" value="0"></div>
@@ -1020,7 +1601,25 @@ input{width:100%;padding:7px;border:1px solid #444;border-radius:8px;background:
 
 <script>
 const st=document.getElementById('st');
-function P(url,o){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).then(r=>r.json());}
+let currentToolHint=null;
+function toggleUiMode(){
+  const simple=document.body.classList.toggle('simple-mode');
+  const btn=document.getElementById('mode_toggle');
+  if(btn) btn.textContent=simple?'完整模式':'简约模式';
+}
+function setCurrentToolHint(tool){
+  currentToolHint=(tool==='灵巧手'||tool==='夹爪'||tool==='电钻')?tool:null;
+}
+function updateToolHintFromAction(action,d){
+  if(!d||!d.ok)return;
+  if(action==='device_switch_hand') setCurrentToolHint('灵巧手');
+  else if(action==='device_switch_gripper') setCurrentToolHint('夹爪');
+  else if(action==='device_switch_drill') setCurrentToolHint('电钻');
+  else if(action==='power_output_off'||action==='drill_pulse') setCurrentToolHint(null);
+  else if(d.current_device) setCurrentToolHint(d.current_device);
+}
+function P(url,o){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o),cache:'no-store'}).then(r=>r.json());}
+function G(url){return fetch(url,{method:'GET',cache:'no-store'}).then(r=>r.json());}
 function fields(){return ['px','py','pz','prx','pry','prz'];}
 function readPose(){return fields().map(id=>parseFloat(document.getElementById(id).value)||0);}
 function fillPose(p){if(!Array.isArray(p)||p.length<6)return;fields().forEach((id,i)=>document.getElementById(id).value=String(Number(p[i]).toFixed(3)));}
@@ -1097,8 +1696,8 @@ function moveTcpRelative(kind){
   };
   const labelMap={
     z_plus:'向上移出 Z+=80',
-    x_plus:'向后移出 X+=80',
-    x_minus:'向前移入 X-=80'
+    x_plus:'向后移出 X+=240',
+    x_minus:'向前移入 X-=240'
   };
   const action=actionMap[kind]; if(!action)return;
   st.textContent='⏳ '+labelMap[kind]+'...';
@@ -1107,6 +1706,25 @@ function moveTcpRelative(kind){
     if(d.ok && Array.isArray(d.pose_target)) fillPose(d.pose_target);
     st.textContent=(d.ok?'✅ ':'❌ ')+labelMap[kind]+' ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
   }).catch(e=>{st.textContent='❌ '+e;});
+}
+
+function demoSessionAction(kind){
+  const action=kind==='begin'?'demo_begin':'demo_end';
+  const label=kind==='begin'?'演示开始':'演示结束';
+  if(kind==='begin'){
+    const q='执行演示开始？\\n\\n将记录当前位置为回归位置，然后移动到固定演示起始位。';
+    if(!window.confirm(q)){
+      st.textContent='❌ 已取消（未执行演示开始）';
+      return;
+    }
+  }
+  st.textContent='⏳ '+label+'...';
+  const t0=performance.now();
+  P('/api/fr10',motionPayload(action)).then(d=>{
+    if(d.ok && Array.isArray(d.pose_target)) fillPose(d.pose_target);
+    st.textContent=(d.ok?'✅ ':'❌ ')+label+' ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
+    queryPose({silent:true}).catch(()=>{});
+  }).catch(e=>{st.textContent='❌ '+label+' 请求失败: '+e;});
 }
 
 function runQuickchangerDemo(){
@@ -1121,6 +1739,88 @@ function runQuickchangerDemo(){
     st.textContent=(d.ok?'✅ ':'❌ ')+'quickchanger demo ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
     queryPose({silent:true}).catch(()=>{});
   }).catch(e=>{st.textContent='❌ '+e;});
+}
+
+function runQuickchangerPreset(aruco_id,label){
+  let msg='执行 '+label+' Quickchanger 流程？\\nArUco ID = '+aruco_id+'\\n\\n流程成功后将自动检查并切换到目标供电。';
+  if(aruco_id===3) msg+='\\n\\n注意：电钻切换供电后会立即转动。';
+  if(!window.confirm(msg)){
+    st.textContent='❌ 已取消（未执行 '+label+' 流程）';
+    return;
+  }
+  st.textContent='⏳ '+label+' Quickchanger 后台任务启动中...';
+  const t0=performance.now();
+  const job_id='qc-client-'+Date.now()+'-'+Math.floor(Math.random()*100000);
+  P('/api/fr10',eePayload('quickchanger_demo_start',{aruco_id,auto_power:true,job_id})).then(d=>{
+    if(!d.ok||!d.job_id){
+      st.textContent='❌ '+label+' quickchanger 启动失败: '+(d.msg||'');
+      return;
+    }
+    pollQuickchangerPreset(d.job_id,label,t0,0,0,aruco_id);
+  }).catch(e=>{
+    st.textContent='⏳ '+label+' 启动响应中断，继续用本地任务号查询... '+e;
+    pollQuickchangerPreset(job_id,label,t0,1,0,aruco_id);
+  });
+}
+
+function pollQuickchangerPreset(job_id,label,t0,failCount,missingCount,aruco_id){
+  setTimeout(()=>{
+    G('/api/fr10_job?job_id='+encodeURIComponent(job_id)+'&aruco_id='+encodeURIComponent(aruco_id||'')).then(d=>{
+      if(!d.ok){
+        const nextMissing=(missingCount||0)+1;
+        if(nextMissing<120){
+          st.textContent='⏳ '+label+' 等待后台任务/返回结果... '+nextMissing+'/120 '+(d.msg||'');
+          pollQuickchangerPreset(job_id,label,t0,0,nextMissing,aruco_id);
+          return;
+        }
+        st.textContent='⚠ '+label+' 暂无法确认返回结果，请查看机械臂和供电状态。'+(d.msg||'');
+        window.alert(label+'暂无法确认返回结果。实际动作可能已经完成，请查看供电状态。');
+        return;
+      }
+      if(!d.done){
+        st.textContent='⏳ '+label+' Quickchanger 执行中... '+(d.msg||d.status||'')+' ('+Math.round((performance.now()-t0)/1000)+'s)';
+        pollQuickchangerPreset(job_id,label,t0,0,0,aruco_id);
+        return;
+      }
+      const r=d.result||{};
+      const powerMsg=r.power_result&&r.power_result.msg?r.power_result.msg:'';
+      const shownMsg=powerMsg||r.msg||d.msg||'';
+      if(r.ok){
+        if(aruco_id===1) setCurrentToolHint('灵巧手');
+        else if(aruco_id===2) setCurrentToolHint('夹爪');
+        else if(aruco_id===3) setCurrentToolHint(null);
+      }
+      st.textContent=(r.ok?'✅ ':'❌ ')+label+' quickchanger ('+Math.round(performance.now()-t0)+'ms) '+shownMsg;
+      if(r.ok){
+        window.alert(label+'切换完成\\n\\n'+(powerMsg||'Quickchanger 已完成，目标供电已处理。'));
+      }else if(powerMsg){
+        window.alert(label+'供电切换异常\\n\\n'+powerMsg);
+      }
+      queryPose({silent:true}).catch(()=>{});
+    }).catch(e=>{
+      const nextFail=failCount+1;
+      st.textContent='⏳ '+label+' Quickchanger 可能仍在执行；状态查询中断 '+nextFail+' 次: '+e;
+      if(nextFail<60){
+        pollQuickchangerPreset(job_id,label,t0,nextFail,missingCount||0,aruco_id);
+      }else{
+        window.alert(label+'状态查询持续中断。动作可能仍在后台执行或已经完成，请查看供电状态确认。');
+      }
+    });
+  },1000);
+}
+
+function clearQuickchangerExperience(aruco_id,label){
+  const q='清除 '+label+' ID'+aruco_id+' 的 quickchanger 经验位置？\\n\\n'
+    +'只会删除该编号记录，不影响其它编号。';
+  if(!window.confirm(q)){
+    st.textContent='❌ 已取消（未清除 '+label+' 经验位置）';
+    return;
+  }
+  st.textContent='⏳ 清除 '+label+' 经验位置...';
+  const t0=performance.now();
+  P('/api/fr10',{action:'quickchanger_clear_experience',aruco_id}).then(d=>{
+    st.textContent=(d.ok?'✅ ':'❌ ')+label+' 清除经验位置 ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
+  }).catch(e=>{st.textContent='❌ '+label+' 清除经验位置请求失败: '+e;});
 }
 
 function motorAction(kind){
@@ -1172,6 +1872,7 @@ function sendEeAction(action,label,extra,opt){
       st.textContent='❌ 已取消（未打开电源输出）';
       return;
     }
+    updateToolHintFromAction(action,d);
     st.textContent=(d.ok?'✅ ':'❌ ')+label+' ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
   }).catch(e=>{st.textContent='❌ '+e;});
 }
@@ -1188,7 +1889,35 @@ function powerAction(kind){
 }
 
 function drillPulse(){
-  sendEeAction('drill_pulse','电钻点动 1s',{});
+  const label='电钻点动';
+  const q='电钻点动将先关闭电源输出，然后执行「切换电钻 20V」上电动作。\\n\\n'
+    +'请确认电钻已固定、周围无人。';
+  if(!window.confirm(q)){
+    st.textContent='❌ 已取消（未打开电钻输出）';
+    return;
+  }
+  st.textContent='⏳ '+label+' 关闭输出...';
+  const t0=performance.now();
+  P('/api/fr10',eePayload('power_output_off',{})).then(off=>{
+    if(!off.ok){
+      st.textContent='❌ '+label+' 关闭输出失败 ('+Math.round(performance.now()-t0)+'ms) '+(off.msg||'');
+      return;
+    }
+    st.textContent='⏳ '+label+' 已关闭输出，等待 0.5s 后切换电钻 20V...';
+    return new Promise(resolve=>{
+      window.setTimeout(()=>{
+        resolve(P('/api/fr10',eePayload('device_switch_drill',{confirm_power_on:true})));
+      },500);
+    });
+  }).then(d=>{
+    if(!d) return;
+    if(!d.ok){
+      st.textContent='❌ '+label+' 切换电钻 20V 失败 ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
+      return;
+    }
+    setCurrentToolHint('电钻');
+    st.textContent='✅ '+label+' 已完成：关闭输出 -> 切换电钻 20V ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
+  }).catch(e=>{st.textContent='❌ '+label+' 请求失败: '+e;});
 }
 
 function busMonitor(){
@@ -1198,6 +1927,25 @@ function busMonitor(){
 function gripperAction(kind){
   if(kind==='open') sendEeAction('gripper_open','夹爪打开',{});
   else if(kind==='close') sendEeAction('gripper_close','夹爪闭合',{});
+}
+
+function toolPayload(action,extra){
+  const rh56_port=(document.getElementById('rh56_port').value||'').trim()||'/dev/fr10-hand-serial';
+  const rh56_hand_id=parseInt(document.getElementById('rh56_hand_id').value||'1',10)||1;
+  const hint=currentToolHint?{tool_hint:currentToolHint}:{};
+  return eePayload(action,Object.assign({rh56_port,rh56_hand_id},hint,extra||{}));
+}
+
+function toolAction(kind){
+  const action=kind==='open'?'tool_open_auto':'tool_close_auto';
+  const label=kind==='open'?'打开':'抓紧/闭合';
+  st.textContent='⏳ '+label+'（自动判断设备）...';
+  const t0=performance.now();
+  P('/api/fr10',toolPayload(action,{})).then(d=>{
+    if(d.current_tool) setCurrentToolHint(d.current_tool);
+    const tool=d.current_tool?('['+d.current_tool+'] '):'';
+    st.textContent=(d.ok?'✅ ':'❌ ')+tool+label+' ('+Math.round(performance.now()-t0)+'ms) '+(d.msg||'');
+  }).catch(e=>{st.textContent='❌ '+label+' 请求失败: '+e;});
 }
 
 function rh56Grip(){
@@ -1305,20 +2053,38 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self._cors()
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length)) if length else {}
 
     def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/fr10_job":
+            qs = urllib.parse.parse_qs(parsed.query)
+            job_id = (qs.get("job_id") or [""])[0]
+            self._json_resp(200, _get_quickchanger_job({"job_id": job_id}))
+            return
+        if parsed.path != "/":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = _HTML.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self._cors()
         self.end_headers()
-        self.wfile.write(_HTML.encode("utf-8"))
+        self.wfile.write(body)
 
     def do_POST(self):
         if self.path != "/api/fr10":

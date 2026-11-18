@@ -1,0 +1,8 @@
+# Stable /dev names for FR10 USB-serial adapters (ttyUSB minor numbers can swap on boot).
+# After install: use /dev/fr10-motor-serial and /dev/fr10-hand-serial in the web UI.
+
+# FTDI bridge (e.g. FT231X), VID:PID 0403:6015 — 常见接电机/控制盒
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", SYMLINK+="fr10-motor-serial"
+
+# QinHeng CH340, VID:PID 1a86:7523 — 常见接灵巧手
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="fr10-hand-serial"

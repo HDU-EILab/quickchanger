@@ -5,12 +5,14 @@ Smooth demo sweep for quickchanger.
 
 Unlike quickchanger_demo_sweep_hd.py, the scan phase sends one continuous MoveL
 from demo_start to demo_end. The parent process keeps sampling RealSense frames
-and robot TCP while that MoveL runs, then returns to the best visible ArUco view
-and reuses the existing quickchanger two-stage move.
+and robot TCP while that MoveL runs. By default, the first valid target ArUco
+detection stops the scan, then the stopped view is rechecked and used for the
+existing quickchanger two-stage move.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import subprocess
 import sys
@@ -41,6 +43,13 @@ DEFAULT_POSE_SYNC_MODE = "buffer"
 DEFAULT_POSE_SAMPLE_HZ = 40.0
 DEFAULT_FRAME_TIME_OFFSET_S = 0.12
 DEFAULT_SCAN_DETECT_SCALE = 0.5
+DEFAULT_MIN_VALID_BEFORE_STOP = 3
+DEFAULT_STOP_ON_FIRST_VISIBLE = True
+DEFAULT_EXPERIENCE_MOVE_VEL = 35.0
+DEFAULT_EXPERIENCE_DISABLED_IDS = (2,)
+DEFAULT_EXPERIENCE_PATH = _DEV_DIR / "quickchanger_experience_positions.json"
+DEFAULT_REQUIRE_VALID_DEPTH_BEFORE_STOP = True
+DEFAULT_STOP_DEPTH_CHECK_FRAMES = 2
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -76,6 +85,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="连续扫描 MoveL 速度；不传则读取 config，默认 20",
+    )
+    ap.add_argument(
+        "--smooth-experience-move-vel",
+        type=float,
+        default=None,
+        help="移动到经验位姿的 MoveL 速度；不传则读取 config，默认 35",
     )
     ap.add_argument(
         "--smooth-sample-hz",
@@ -140,6 +155,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument(
+        "--smooth-min-valid-before-stop",
+        type=int,
+        default=None,
+        help="目标窗口至少累计多少帧有效匹配后，才允许连续丢失触发 StopMotion；不传则读取 config",
+    )
+    ap.add_argument(
+        "--no-stop-on-first-visible",
+        action="store_true",
+        help="禁用首帧有效目标即停，回退到历史中间匹配视角逻辑",
+    )
+    ap.add_argument(
+        "--experience-path",
+        type=Path,
+        default=None,
+        help=f"按 ArUco ID 记录经验停止位姿的 JSON 文件，默认 {DEFAULT_EXPERIENCE_PATH.name}",
+    )
+    ap.add_argument(
+        "--no-experience",
+        action="store_true",
+        help="禁用经验位姿复用，直接执行原扫描起点到终点搜索",
+    )
+    ap.add_argument(
         "--_smooth-move-worker",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -174,6 +211,13 @@ def apply_smooth_config(args: argparse.Namespace, argv: list[str]):
         args.smooth_scan_vel = float(
             cfg.get("smooth_scan_vel", DEFAULT_SMOOTH_SCAN_VEL)
         )
+    if args.smooth_experience_move_vel is None:
+        args.smooth_experience_move_vel = float(
+            cfg.get(
+                "smooth_experience_move_vel",
+                cfg.get("smooth_scan_vel", DEFAULT_EXPERIENCE_MOVE_VEL),
+            )
+        )
     if args.smooth_sample_hz is None:
         args.smooth_sample_hz = float(
             cfg.get("smooth_sample_hz", DEFAULT_SAMPLE_HZ)
@@ -196,7 +240,104 @@ def apply_smooth_config(args: argparse.Namespace, argv: list[str]):
         args.scan_detect_scale = float(
             cfg.get("smooth_scan_detect_scale", DEFAULT_SCAN_DETECT_SCALE)
         )
+    if args.smooth_min_valid_before_stop is None:
+        args.smooth_min_valid_before_stop = int(
+            cfg.get("smooth_min_valid_before_stop", DEFAULT_MIN_VALID_BEFORE_STOP)
+        )
+    cfg_stop_first = bool(
+        cfg.get("smooth_stop_on_first_visible", DEFAULT_STOP_ON_FIRST_VISIBLE)
+    )
+    args.smooth_stop_on_first_visible = (
+        cfg_stop_first and not args.no_stop_on_first_visible
+    )
+    if args.experience_path is None:
+        exp_path = Path(cfg.get("smooth_experience_path", str(DEFAULT_EXPERIENCE_PATH)))
+        args.experience_path = exp_path if exp_path.is_absolute() else _DEV_DIR / exp_path
+    disabled_ids = cfg.get("smooth_experience_disabled_ids", DEFAULT_EXPERIENCE_DISABLED_IDS)
+    if not isinstance(disabled_ids, (list, tuple)):
+        disabled_ids = DEFAULT_EXPERIENCE_DISABLED_IDS
+    args.smooth_experience_disabled_ids = {
+        int(x) for x in disabled_ids
+        if isinstance(x, (int, float, str)) and str(x).strip()
+    }
+    args.smooth_require_valid_depth_before_stop = bool(
+        cfg.get(
+            "smooth_require_valid_depth_before_stop",
+            DEFAULT_REQUIRE_VALID_DEPTH_BEFORE_STOP,
+        )
+    )
+    args.smooth_stop_depth_check_frames = max(
+        1,
+        int(cfg.get("smooth_stop_depth_check_frames", DEFAULT_STOP_DEPTH_CHECK_FRAMES)),
+    )
     return cfg
+
+
+def marker_depth_ok_for_stop(
+    args: argparse.Namespace,
+    cam,
+    label: str,
+) -> tuple[bool, object | None, object | None, object | None, float]:
+    color, depth, result, score = capture_detection(args, cam)
+    if not result.ok or result.center_uv is None or score < float(args.min_perimeter_px):
+        print(
+            f"[SMOOTH] {label} 停止前深度确认：目标复查不稳定 "
+            f"score={score:.1f}"
+        )
+        return False, color, depth, result, score
+
+    old_frames = getattr(args, "depth_frames", 7)
+    args.depth_frames = int(getattr(args, "smooth_stop_depth_check_frames", 2))
+    try:
+        depth_m, depth_tag, _ = qc.marker_depth_m(args, result, depth, cam)
+    finally:
+        args.depth_frames = old_frames
+
+    if depth_m <= 1e-6:
+        print("[SMOOTH] {label} 停止前深度确认：无有效深度，继续扫描".format(label=label))
+        return False, color, depth, result, score
+    print(
+        f"[SMOOTH] {label} 停止前深度确认通过: "
+        f"depth={depth_m * 1000.0:.1f}mm tag={depth_tag}"
+    )
+    return True, color, depth, result, score
+
+
+def run_quickchanger_with_depth_retries(
+    args: argparse.Namespace,
+    cam,
+    T_c2g: np.ndarray,
+    rob,
+    color: np.ndarray,
+    depth: np.ndarray,
+    result,
+    score: float,
+) -> int:
+    attempts = max(1, int(getattr(args, "quickchanger_depth_retry_frames", 6)))
+    for attempt in range(1, attempts + 1):
+        if result.ok and score >= float(args.min_perimeter_px):
+            print(
+                f"[SMOOTH] quickchanger 深度/落位尝试 {attempt}/{attempts}, "
+                f"score={score:.1f}"
+            )
+            ret = qc.move_to_quickchanger_target(
+                args, result, color, depth, cam, T_c2g, rob
+            )
+            if ret != qc.QUICKCHANGER_BAD_DEPTH_CODE:
+                return ret
+            print("[WARN] quickchanger 深度异常，静止位置重新取帧后再试")
+        else:
+            print(
+                f"[WARN] quickchanger 重试帧未稳定识别目标，score={score:.1f}，继续取帧"
+            )
+
+        if attempt >= attempts:
+            break
+        time.sleep(0.08)
+        color, depth, result, score = capture_detection(args, cam)
+
+    print("[FAIL] quickchanger 多次复查仍未获得可用深度，未下发阶段1/阶段2")
+    return qc.QUICKCHANGER_BAD_DEPTH_CODE
 
 
 def run_move_worker(args: argparse.Namespace) -> int:
@@ -455,6 +596,9 @@ def validate_args(args: argparse.Namespace) -> int:
     if args.smooth_scan_vel <= 0:
         print("[FAIL] --smooth-scan-vel 必须 > 0")
         return 2
+    if args.smooth_experience_move_vel <= 0:
+        print("[FAIL] --smooth-experience-move-vel 必须 > 0")
+        return 2
     if args.pose_sync_mode not in ("buffer", "bracket", "after"):
         print("[FAIL] --pose-sync-mode 必须是 buffer、bracket 或 after")
         return 2
@@ -467,87 +611,250 @@ def validate_args(args: argparse.Namespace) -> int:
     if not (0.0 < args.scan_detect_scale <= 1.0):
         print("[FAIL] --scan-detect-scale 必须在 (0, 1] 范围内")
         return 2
+    if args.smooth_min_valid_before_stop < 1:
+        print("[FAIL] --smooth-min-valid-before-stop 必须 >= 1")
+        return 2
     return 0
 
 
-def run_smooth_demo(args: argparse.Namespace) -> int:
-    bad = validate_args(args)
-    if bad:
-        return bad
+def pose_distance_xyz(a: list[float], b: list[float]) -> float:
+    return float(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)) ** 0.5)
 
-    T_c2g = qc.ppm.load_T_cam2gripper()
-    print("[OK] 已加载 T_cam2gripper（来自 calibration/sessions/active/）")
-    cam, profile = qc.open_from_namespace(args)
-    qc.print_stream_info(cam, profile)
-    rob = qc._load_robot(args.host)
 
-    best = None
-    valid_matches = []
-    seen_once = False
-    lost_after_seen = 0
-    triggered = False
-    proc = None
+def load_experience(args: argparse.Namespace) -> dict:
+    if args.no_experience:
+        return {}
+    path = Path(args.experience_path)
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"[WARN] 经验位姿文件读取失败，跳过: {path}: {exc}")
+        return {}
+
+
+def experience_disabled_for_id(args: argparse.Namespace) -> bool:
+    disabled = getattr(args, "smooth_experience_disabled_ids", set())
+    return int(args.aruco_id) in disabled
+
+
+def experience_pose_for(args: argparse.Namespace) -> list[float] | None:
+    if experience_disabled_for_id(args):
+        print(f"[SMOOTH] ArUco ID={args.aruco_id} 已禁用经验位复用，直接走扫描流程")
+        return None
+    data = load_experience(args)
+    item = data.get(str(int(args.aruco_id)))
+    if not isinstance(item, dict):
+        return None
+    source = str(item.get("source", ""))
+    if not source.startswith("scan_path_y_"):
+        print(
+            f"[SMOOTH] 忽略旧版经验位姿 source={source!r}；"
+            "仅复用按扫描轨迹 Y 生成的新经验位"
+        )
+        return None
+    pose = item.get("stop_pose")
+    if not isinstance(pose, (list, tuple)) or len(pose) < 6:
+        return None
+    try:
+        pose6 = [float(pose[i]) for i in range(6)]
+    except Exception:
+        return None
+    expected, _t, inside = scan_pose_for_target_y(
+        pose6[1],
+        list(args.demo_start),
+        list(args.demo_end),
+    )
+    if not inside or len(expected) < 6:
+        print("[SMOOTH] 忽略经验位姿：该 Y 不在当前扫描轨迹范围内")
+        return None
+    max_err = max(abs(float(pose6[i]) - float(expected[i])) for i in range(6))
+    if max_err > 1e-3:
+        print(
+            f"[SMOOTH] 忽略经验位姿：坐标不在当前扫描轨迹上 "
+            f"max_err={max_err:.3f}mm/deg"
+        )
+        return None
+    return pose6
+
+
+def save_experience_pose(
+    args: argparse.Namespace,
+    stop_pose: list[float],
+    source: str,
+    score: float,
+) -> None:
+    if args.no_experience:
+        return
+    if experience_disabled_for_id(args):
+        print(f"[SMOOTH] ArUco ID={args.aruco_id} 已禁用经验位写入，本次不保存经验位置")
+        return
+    path = Path(args.experience_path)
+    data = load_experience(args)
+    data[str(int(args.aruco_id))] = {
+        "aruco_id": int(args.aruco_id),
+        "stop_pose": [round(float(x), 3) for x in stop_pose[:6]],
+        "source": source,
+        "score": round(float(score), 3),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp.replace(path)
+        print(
+            f"[SMOOTH] 已更新 ArUco ID={args.aruco_id} 经验停止位姿: "
+            f"{[round(x, 2) for x in stop_pose[:6]]} -> {path}"
+        )
+    except Exception as exc:
+        print(f"[WARN] 经验位姿文件写入失败: {path}: {exc}")
+
+
+def scan_pose_for_target_y(
+    target_y: float,
+    start_pose: list[float],
+    end_pose: list[float],
+) -> tuple[list[float], float, bool]:
+    start = [float(x) for x in start_pose[:6]]
+    end = [float(x) for x in end_pose[:6]]
+    dy = end[1] - start[1]
+    if abs(dy) < 1e-6:
+        if abs(float(target_y) - start[1]) < 1e-6:
+            return list(start), 0.0, True
+        return [], 0.0, False
+    t_raw = (float(target_y) - start[1]) / dy
+    if t_raw < 0.0 or t_raw > 1.0:
+        return [], t_raw, False
+    pose = [start[i] + (end[i] - start[i]) * t_raw for i in range(6)]
+    return pose, t_raw, True
+
+
+def experience_pose_from_quickchanger_result(
+    args: argparse.Namespace,
+) -> tuple[list[float] | None, str, float | None]:
+    info = getattr(args, "quickchanger_last_move_info", None)
+    if not isinstance(info, dict):
+        return None, "quickchanger_no_move_info", None
+
+    actual_pose = info.get("actual_after_pose")
+    final_pose = info.get("final_pose")
+    use_actual = isinstance(actual_pose, list) and len(actual_pose) >= 2
+    source_pose = actual_pose if use_actual else final_pose
+    if not isinstance(source_pose, list) or len(source_pose) < 2:
+        return None, "quickchanger_no_final_y", None
+
+    final_y = float(source_pose[1])
+    exp_pose, t, inside = scan_pose_for_target_y(
+        final_y,
+        list(args.demo_start),
+        list(args.demo_end),
+    )
+    source = "scan_path_y_actual_after" if use_actual else "scan_path_y_final_target"
+    if not inside:
+        print(
+            f"[WARN] 快换落位 Y={final_y:.2f} 超出扫描轨迹 Y 范围，"
+            f"无法在当前扫描线段上生成 Y 相同的经验位姿 t={t:.3f}，本次不更新经验位置"
+        )
+        return None, source + "_outside_scan_path", final_y
+    print(
+        f"[SMOOTH] 经验位姿按快换落位 Y 生成: y={final_y:.2f}, "
+        f"scan_t={t:.3f}, pose={[round(x, 2) for x in exp_pose[:6]]}"
+    )
+    return exp_pose, source, final_y
+
+
+def make_match(
+    args: argparse.Namespace,
+    label: str,
+    frame_idx: int,
+    result,
+    score: float,
+    pose: list[float],
+    color=None,
+    depth=None,
+    scan_t: float = 0.0,
+    pose_skew_ms: float = 0.0,
+    frame_latency_ms: float = 0.0,
+):
+    return {
+        "label": label,
+        "score": float(score),
+        "pose": pose[:6],
+        "frame": frame_idx,
+        "color": color,
+        "depth": depth,
+        "result": result,
+        "scan_t": scan_t,
+        "pose_skew_ms": pose_skew_ms,
+        "frame_latency_ms": frame_latency_ms,
+        "rs_frame_no": None,
+    }
+
+
+def detect_at_current_pose(args: argparse.Namespace, cam, label: str):
+    color, depth, result, score = capture_detection(args, cam)
+    ok = bool(result.ok and result.center_uv is not None and score >= float(args.min_perimeter_px))
+    print(
+        f"[SMOOTH] {label} 定点复查: "
+        f"ok={ok} score={score:.1f} threshold={float(args.min_perimeter_px):.1f}"
+    )
+    if not ok:
+        return None
+    if getattr(args, "smooth_require_valid_depth_before_stop", True):
+        old_frames = getattr(args, "depth_frames", 7)
+        args.depth_frames = int(getattr(args, "smooth_stop_depth_check_frames", 2))
+        try:
+            depth_m, depth_tag, _ = qc.marker_depth_m(args, result, depth, cam)
+        finally:
+            args.depth_frames = old_frames
+        if depth_m <= 1e-6:
+            print(f"[SMOOTH] {label} 定点复查深度无效，改走扫描流程")
+            return None
+        print(
+            f"[SMOOTH] {label} 定点复查深度通过: "
+            f"depth={depth_m * 1000.0:.1f}mm tag={depth_tag}"
+        )
+    pose = read_tcp_pose_light(args.host)
+    return make_match(args, label, 0, result, score, pose, color, depth)
+
+
+def scan_move_for_target(
+    args: argparse.Namespace,
+    cam,
+    target_pose: list[float],
+    label: str,
+):
+    print(f"[SMOOTH] {label} 连续检测 MoveL 目标: {[round(x, 2) for x in target_pose[:6]]}")
+    if args.dry_run:
+        return detect_at_current_pose(args, cam, label)
+
+    proc = start_continuous_move_worker(args, list(target_pose))
     pose_sampler = None
+    if args.pose_sync_mode == "buffer":
+        pose_sampler = PoseSampler(args.host, args.pose_sample_hz)
+        pose_sampler.start()
+        time.sleep(0.05)
+
     frame_idx = 0
+    detected_frames = 0
+    valid_frames = 0
     scan_started = time.monotonic()
     stats_started = scan_started
     last_stats_log = scan_started
-    detected_frames = 0
-    valid_frames = 0
+    last_miss_log = -999
     sample_period = 1.0 / float(args.smooth_sample_hz)
-
+    found = None
     try:
-        print(f"[SMOOTH] 目标 ArUco ID={args.aruco_id}, dictionary={args.dictionary}")
-        print(
-            "[SMOOTH] 连续扫描参数:",
-            f"vel={float(args.smooth_scan_vel):.1f}",
-            f"sample_hz={float(args.smooth_sample_hz):.1f}",
-            f"lost_after_visible={int(args.lost_after_visible)}",
-            f"stop_on_lost={bool(args.smooth_stop_on_lost)}",
-            f"pose_sync={args.pose_sync_mode}",
-            f"pose_sample_hz={float(args.pose_sample_hz):.1f}",
-            f"frame_offset={float(args.frame_time_offset_s):.3f}s",
-            f"detect_scale={float(args.scan_detect_scale):.2f}",
-        )
-        err = move_or_dry_run(
-            args,
-            rob,
-            list(args.demo_start),
-            "移动到演示扫描起点",
-            float(args.smooth_scan_vel),
-        )
-        if err != 0:
-            return err
-
-        if args.dry_run:
-            print("[dry-run] 不下发连续扫描 MoveL；仅采样当前画面约 3 秒")
-            dry_end = time.monotonic() + 3.0
-        else:
-            print("[SMOOTH] 启动连续扫描 MoveL:", [round(x, 2) for x in args.demo_end])
-            close_robot_rpc(rob)
-            rob = None
-            proc = start_continuous_move_worker(args, list(args.demo_end))
-            if args.pose_sync_mode == "buffer":
-                pose_sampler = PoseSampler(args.host, args.pose_sample_hz)
-                pose_sampler.start()
-                time.sleep(0.05)
-            dry_end = None
-        if args.dry_run and args.pose_sync_mode == "buffer":
-            pose_sampler = PoseSampler(args.host, args.pose_sample_hz)
-            pose_sampler.start()
-            time.sleep(0.08)
-        scan_started = time.monotonic()
-        stats_started = scan_started
-        last_stats_log = scan_started
-
-        last_miss_log = -999
         while True:
-            scan_move_finished = False
-            if args.dry_run:
-                if time.monotonic() >= dry_end:
-                    scan_move_finished = True
-            elif proc is not None and proc.poll() is not None:
-                scan_move_finished = True
+            if proc.poll() is not None:
+                print(f"[SMOOTH] {label} MoveL 已到目标/结束，未命中目标")
+                break
 
             loop_t0 = time.monotonic()
             frame_idx += 1
@@ -564,174 +871,194 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
                     frame_latency_ms,
                 ) = capture_detection_synced(args, cam, pose_sampler)
             except Exception as exc:
-                print(f"[WARN] 同步采样失败: {exc}")
+                print(f"[WARN] {label} 同步采样失败: {exc}")
                 time.sleep(sample_period)
                 continue
+
             detected = bool(result.ok and result.center_uv is not None)
             ok_for_score = detected and score >= float(args.min_perimeter_px)
-            seen_ids = getattr(result, "seen_ids", ()) or ()
-            other_ids = [int(x) for x in seen_ids if int(x) != int(args.aruco_id)]
-            other_id_ends_window = bool(best is not None and seen_once and other_ids)
             if detected:
                 detected_frames += 1
-            if ok_for_score and not other_id_ends_window:
+            if ok_for_score:
                 valid_frames += 1
-
-            if other_id_ends_window:
-                lost_after_seen = max(lost_after_seen, int(args.lost_after_visible))
-                print(
-                    "[SMOOTH] 已进入其它 ArUco 编号区域，立即结束目标窗口："
-                    f"target_id={args.aruco_id}, other_ids={other_ids}, "
-                    f"seen_ids={list(seen_ids)}"
-                )
-            elif detected:
                 u, v = result.center_uv
                 rs_frame_no = getattr(cam, "last_frame_number", None)
                 print(
-                    f"[SMOOTH] frame={frame_idx} rs_frame={rs_frame_no} "
-                    f"t={pose_t - scan_started:.2f}s "
-                    f"id={result.marker_id} center=({u:.1f},{v:.1f}) "
-                    f"perimeter={result.perimeter_px:.1f}px score={score:.1f} "
-                    f"pose_sync={pose_sync_mode} skew={pose_skew_ms:.1f}ms "
-                    f"frame_latency={frame_latency_ms:.1f}ms"
+                    f"[SMOOTH] {label} 命中 frame={frame_idx} rs_frame={rs_frame_no} "
+                    f"t={pose_t - scan_started:.2f}s id={result.marker_id} "
+                    f"center=({u:.1f},{v:.1f}) perimeter={result.perimeter_px:.1f}px "
+                    f"score={score:.1f} skew={pose_skew_ms:.1f}ms "
+                    f"latency={frame_latency_ms:.1f}ms"
                 )
-                if ok_for_score:
-                    seen_once = True
-                    lost_after_seen = 0
-                    match = {
-                        "score": score,
-                        "pose": tcp_pose[:6],
-                        "frame": frame_idx,
-                        "color": color,
-                        "depth": depth,
-                        "result": result,
-                        "scan_t": pose_t - scan_started,
-                        "pose_skew_ms": pose_skew_ms,
-                        "frame_latency_ms": frame_latency_ms,
-                        "rs_frame_no": rs_frame_no,
-                    }
-                    valid_matches.append(match)
-                    mid_idx = (len(valid_matches) - 1) // 2
-                    best = valid_matches[mid_idx]
-                    print(
-                        f"[SMOOTH] 记录有效匹配 #{len(valid_matches)}："
-                        f"frame={frame_idx}, score={score:.1f}, "
-                        f"tcp={[round(x, 2) for x in tcp_pose[:6]]}"
+                if getattr(args, "smooth_require_valid_depth_before_stop", True):
+                    depth_ok, depth_color, depth_np, depth_result, depth_score = (
+                        marker_depth_ok_for_stop(args, cam, label)
                     )
-                    print(
-                        f"[SMOOTH] 当前中间匹配视角："
-                        f"match_index={mid_idx + 1}/{len(valid_matches)}, "
-                        f"frame={best['frame']}, "
-                        f"tcp={[round(x, 2) for x in best['pose']]}"
-                    )
-                elif not ok_for_score:
-                    print(
-                        f"[SMOOTH] 已识别但低于评分阈值 "
-                        f"({score:.1f} < {args.min_perimeter_px:.1f})"
-                    )
-                    if seen_once:
-                        lost_after_seen += 1
-                        print(
-                            f"[SMOOTH] 目标未达有效阈值，按丢失计数 "
-                            f"{lost_after_seen}/{args.lost_after_visible}"
-                        )
-            else:
-                if seen_once:
-                    lost_after_seen += 1
-                    extra = f"，本帧看到其它 id={list(seen_ids)}" if seen_ids else ""
-                    print(
-                        f"[SMOOTH] 首次识别后未检测到目标 "
-                        f"{lost_after_seen}/{args.lost_after_visible}{extra}"
-                    )
-                elif frame_idx == 1 or frame_idx - last_miss_log >= max(1, int(args.smooth_sample_hz)):
-                    print(f"[SMOOTH] 尚未检测到目标 ArUco frame={frame_idx}")
-                    last_miss_log = frame_idx
-
-            if (
-                best is not None
-                and not args.complete_scan
-                and seen_once
-                and lost_after_seen >= int(args.lost_after_visible)
-            ):
-                print("[SMOOTH] 目标连续丢失，结束连续扫描并开始定位")
-                triggered = True
-                if not args.dry_run and bool(args.smooth_stop_on_lost):
-                    stop_motion_light(args.host)
+                    if not depth_ok:
+                        continue
+                    color = depth_color
+                    depth = depth_np
+                    result = depth_result
+                    score = depth_score
+                stop_motion_light(args.host)
+                time.sleep(0.2)
+                stop_pose = read_tcp_pose_light(args.host)
+                found = make_match(
+                    args,
+                    label,
+                    frame_idx,
+                    result,
+                    score,
+                    stop_pose,
+                    color,
+                    depth,
+                    pose_t - scan_started,
+                    pose_skew_ms,
+                    frame_latency_ms,
+                )
+                found["rs_frame_no"] = rs_frame_no
+                print(
+                    f"[SMOOTH] {label} 已停止在当前位置: "
+                    f"{[round(x, 2) for x in stop_pose[:6]]}"
+                )
                 break
 
-            if scan_move_finished:
-                print("[SMOOTH] 连续扫描 MoveL 已到终点，结束采样循环")
-                break
+            if frame_idx == 1 or frame_idx - last_miss_log >= max(1, int(args.smooth_sample_hz)):
+                seen_ids = getattr(result, "seen_ids", ()) or ()
+                extra = f"，本帧看到其它 id={list(seen_ids)}" if seen_ids else ""
+                print(f"[SMOOTH] {label} 尚未检测到目标 ArUco frame={frame_idx}{extra}")
+                last_miss_log = frame_idx
 
             now = time.monotonic()
             if now - last_stats_log >= 1.0:
                 duration = max(1e-6, now - stats_started)
                 print(
-                    f"[SMOOTH] scan_stats frames={frame_idx} "
+                    f"[SMOOTH] {label} scan_stats frames={frame_idx} "
                     f"fps={frame_idx / duration:.1f} "
-                    f"detected={detected_frames} valid={valid_frames} "
-                    f"lost={lost_after_seen}"
+                    f"detected={detected_frames} valid={valid_frames}"
                 )
                 last_stats_log = now
 
             elapsed = time.monotonic() - loop_t0
             if elapsed < sample_period:
                 time.sleep(sample_period - elapsed)
-
-        if proc is not None:
-            try:
-                proc.wait(timeout=8.0)
-            except subprocess.TimeoutExpired:
-                print("[WARN] 连续扫描 worker 未及时退出，终止子进程")
-                proc.terminate()
+    finally:
+        if pose_sampler is not None:
+            pose_sampler.stop()
+        if proc.poll() is None:
+            if found is None:
                 try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            drain_worker_output(proc)
-            if proc.returncode not in (0, None) and best is None:
-                print(f"[FAIL] 连续扫描 MoveL 失败 return={proc.returncode}")
-                return int(proc.returncode)
+                    stop_motion_light(args.host)
+                except Exception:
+                    pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        else:
+            proc.wait(timeout=1.0)
+        drain_worker_output(proc)
+    return found
+
+
+def choose_nearest_endpoint(current_pose: list[float], start_pose: list[float], end_pose: list[float]):
+    d_start = pose_distance_xyz(current_pose, start_pose)
+    d_end = pose_distance_xyz(current_pose, end_pose)
+    if d_start <= d_end:
+        return list(start_pose), list(end_pose), "扫描起点", "扫描终点", d_start, d_end
+    return list(end_pose), list(start_pose), "扫描终点", "扫描起点", d_end, d_start
+
+
+def run_smooth_demo(args: argparse.Namespace) -> int:
+    bad = validate_args(args)
+    if bad:
+        return bad
+
+    T_c2g = qc.ppm.load_T_cam2gripper()
+    print("[OK] 已加载 T_cam2gripper（来自 calibration/sessions/active/）")
+    cam, profile = qc.open_from_namespace(args)
+    qc.print_stream_info(cam, profile)
+    rob = qc._load_robot(args.host)
+
+    try:
+        print(f"[SMOOTH] 目标 ArUco ID={args.aruco_id}, dictionary={args.dictionary}")
+        print(
+            "[SMOOTH] 连续扫描参数:",
+            f"vel={float(args.smooth_scan_vel):.1f}",
+            f"experience_vel={float(args.smooth_experience_move_vel):.1f}",
+            f"sample_hz={float(args.smooth_sample_hz):.1f}",
+            f"stop_on_lost={bool(args.smooth_stop_on_lost)}",
+            f"pose_sync={args.pose_sync_mode}",
+            f"pose_sample_hz={float(args.pose_sample_hz):.1f}",
+            f"frame_offset={float(args.frame_time_offset_s):.3f}s",
+            f"detect_scale={float(args.scan_detect_scale):.2f}",
+            f"depth_before_stop={bool(args.smooth_require_valid_depth_before_stop)}",
+            f"depth_check_frames={int(args.smooth_stop_depth_check_frames)}",
+            f"experience={'off' if args.no_experience else str(args.experience_path)}",
+        )
+        best = None
+        exp_pose = experience_pose_for(args)
+        close_robot_rpc(rob)
+        rob = None
+
+        if exp_pose is not None:
+            print(
+                f"[SMOOTH] 找到 ArUco ID={args.aruco_id} 经验停止位姿，优先复用: "
+                f"{[round(x, 2) for x in exp_pose[:6]]}"
+            )
+            rob = qc._load_robot(args.host)
+            err = move_or_dry_run(
+                args,
+                rob,
+                exp_pose,
+                "移动到经验位姿（到位后再检测）",
+                float(args.smooth_experience_move_vel),
+            )
+            close_robot_rpc(rob)
+            rob = None
+            if err != 0:
+                print("[WARN] 移动到经验位姿失败，改走常规扫描端点")
+            else:
+                best = detect_at_current_pose(args, cam, "经验位姿")
+            if best is not None:
+                print("[SMOOTH] 经验位姿命中目标，跳过常规扫描")
 
         if best is None:
-            print("[FAIL] 连续扫描过程中未检测到满足阈值的 ArUco")
+            current_pose = read_tcp_pose_light(args.host)
+            near_pose, far_pose, near_label, far_label, d_near, d_far = choose_nearest_endpoint(
+                current_pose,
+                list(args.demo_start),
+                list(args.demo_end),
+            )
+            print(
+                f"[SMOOTH] 经验位姿不可用/未命中；当前更接近{near_label} "
+                f"(near={d_near:.1f}mm, far={d_far:.1f}mm)"
+            )
+            best = scan_move_for_target(args, cam, near_pose, f"前往{near_label}")
+            if best is None:
+                best = detect_at_current_pose(args, cam, near_label)
+            if best is None:
+                best = scan_move_for_target(args, cam, far_pose, f"{near_label}到{far_label}扫描")
+
+        if best is None:
+            print("[FAIL] 经验位姿与双向扫描过程中均未检测到满足阈值的 ArUco")
             return 1
 
-        duration = max(1e-6, time.monotonic() - stats_started)
         print(
-            f"[SMOOTH] 扫描统计 frames={frame_idx}, "
-            f"fps={frame_idx / duration:.1f}, "
-            f"detected={detected_frames}, valid={valid_frames}"
-        )
-
-        if not triggered:
-            print("[SMOOTH] 连续扫描结束，使用历史中间匹配视角执行 quickchanger")
-
-        print(
-            f"[SMOOTH] 中间匹配视角 frame={best['frame']}, "
-            f"rs_frame={best.get('rs_frame_no')}, "
-            f"t={best['scan_t']:.2f}s, score={best['score']:.1f}, "
-            f"pose_skew={best.get('pose_skew_ms', 0.0):.1f}ms, "
-            f"frame_latency={best.get('frame_latency_ms', 0.0):.1f}ms, "
+            f"[SMOOTH] 选定停止视角 source={best.get('label', '')} "
+            f"frame={best.get('frame')} rs_frame={best.get('rs_frame_no')} "
+            f"t={best.get('scan_t', 0.0):.2f}s score={best['score']:.1f} "
             f"pose={[round(x, 2) for x in best['pose']]}"
         )
-        if rob is None:
-            rob = qc._load_robot(args.host)
-        err = move_or_dry_run(
-            args,
-            rob,
-            best["pose"],
-            "回到/保持最佳视角",
-            float(args.smooth_scan_vel),
-        )
-        if err != 0:
-            return err
-        time.sleep(0.1)
+        rob = qc._load_robot(args.host)
+        print("[SMOOTH] 已停在选定位置；不回到历史中间视角")
+        time.sleep(0.2)
 
         color, depth, result, score = capture_detection(args, cam)
         if not result.ok or score < float(args.min_perimeter_px):
             print(
-                f"[FAIL] 最佳视角复查 ArUco 不稳定，score={score:.1f}，"
+                f"[FAIL] 停止视角复查 ArUco 不稳定，score={score:.1f}，"
                 "未执行 quickchanger"
             )
             return 1
@@ -739,18 +1066,29 @@ def run_smooth_demo(args: argparse.Namespace) -> int:
         out = qc.ACTIVE_DIR / "quickchanger_smooth_best.jpg"
         out.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out), qc.draw_aruco_overlay(color, result))
-        print(f"[SMOOTH] 最佳视角标注图 {out}")
+        print(f"[SMOOTH] 停止视角标注图 {out}")
+        pre_stage1_pose = read_tcp_pose_light(args.host)
+        print(
+            "[SMOOTH] 进入 stage1 前 TCP 位姿: "
+            f"{[round(x, 2) for x in pre_stage1_pose[:6]]}"
+        )
         print("[SMOOTH] 调用 quickchanger 两阶段移动逻辑")
-        return qc.move_to_quickchanger_target(args, result, color, depth, cam, T_c2g, rob)
+        ret = run_quickchanger_with_depth_retries(
+            args, cam, T_c2g, rob, color, depth, result, score
+        )
+        if ret == 0:
+            exp_save_pose, exp_source, exp_y = experience_pose_from_quickchanger_result(args)
+            if exp_save_pose is None:
+                print(
+                    "[WARN] 无法按快换落位 Y 在扫描轨迹上生成经验位姿，"
+                    "本次不更新经验位置"
+                )
+            else:
+                save_experience_pose(args, exp_save_pose, exp_source, score)
+                if exp_y is not None:
+                    print(f"[SMOOTH] 经验位姿对应快换落位 Y={exp_y:.2f} mm")
+        return ret
     finally:
-        if pose_sampler is not None:
-            pose_sampler.stop()
-        if proc is not None and proc.poll() is None:
-            try:
-                stop_motion_light(args.host)
-            except Exception:
-                pass
-            proc.terminate()
         close_robot_rpc(rob)
         cam.stop()
 

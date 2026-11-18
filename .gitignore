@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+/web_teach_192.168.58.2/calibration/sessions/*
+!/web_teach_192.168.58.2/calibration/sessions/active/
+/web_teach_192.168.58.2/calibration/sessions/active/*
+!/web_teach_192.168.58.2/calibration/sessions/active/field_offset.json
+!/web_teach_192.168.58.2/calibration/sessions/active/handeye_result.json
+!/web_teach_192.168.58.2/calibration/sessions/active/intrinsics.npz
+!/web_teach_192.168.58.2/calibration/sessions/active/meta.json
+/web_teach_192.168.58.2/calibration_hd_test/quickchanger_experience_positions.json*

@@ -4,15 +4,26 @@
     -2.0,
     37.0
   ],
+  "stage1_retry_deadzone_z_by_id": {
+    "2": [
+      27.0,
+      17.0
+    ]
+  },
   "stage2_deadzone_mm": [
     -2.0,
     -2.0,
     -3.0
   ],
-  "quickchanger_move_vel": 25.0,
+  "quickchanger_depth_min_mm": 180.0,
+  "quickchanger_depth_max_mm": 800.0,
+  "quickchanger_depth_retry_frames": 6,
+  "quickchanger_move_vel": 70.0,
+  "stage1_move_vel": 80.0,
+  "stage2_move_vel": 70.0,
   "demo_start": [
     -769.0,
-    -82.0,
+    -250.0,
     1118.0,
     -159.0,
     16.0,
@@ -32,17 +43,32 @@
   "demo_settle_s": 0.02,
   "min_perimeter_px": 120.0,
   "smooth_scan_vel": 35.0,
+  "smooth_experience_move_vel": 70.0,
   "smooth_sample_hz": 30.0,
   "smooth_stop_on_lost": true,
   "smooth_pose_sync_mode": "buffer",
   "smooth_pose_sample_hz": 40.0,
   "smooth_frame_time_offset_s": 0.12,
   "smooth_scan_detect_scale": 0.5,
+  "smooth_stop_on_first_visible": true,
+  "smooth_min_valid_before_stop": 3,
+  "smooth_require_valid_depth_before_stop": true,
+  "smooth_stop_depth_check_frames": 2,
+  "smooth_experience_disabled_ids": [
+    2
+  ],
+  "smooth_experience_path": "quickchanger_experience_positions.json",
   "_comments": {
     "stage1_deadzone_mm": "阶段1预对准补偿，单位 mm，格式 [base_X, base_Y, base_Z]。当前 [-2,-2,37] 表示先到最终点上方约 40 mm 的预对准位置。通常只在现场重新实测后修改。",
+    "stage1_retry_deadzone_z_by_id": "阶段1 MoveL 返回 112 时，按 ArUco ID 尝试的备用阶段1 Z 补偿，单位 mm；X/Y 沿用 stage1_deadzone_mm。当前只对 ID2 夹爪启用 [27,17]，正常成功路径不会使用。",
     "stage2_deadzone_mm": "阶段2最终点补偿，单位 mm，格式 [base_X, base_Y, base_Z]。当前 [-2,-2,-3] 是最终插入/对接点补偿。该值直接影响最终落点。",
-    "quickchanger_move_vel": "最终 quickchanger 两阶段 MoveL 速度百分比。用于 run_quickchanger、run_quickchanger_demo、run_quickchanger_smooth 的最终定位阶段。建议 10-40；越大越快，风险也越高。",
-    "demo_start": "演示扫描起点 TCP 位姿，单位 [mm, mm, mm, deg, deg, deg]，格式 [X,Y,Z,Rx,Ry,Rz]。",
+    "quickchanger_depth_min_mm": "quickchanger 落位前允许的最小 ArUco 深度，单位 mm。低于该值认为 RealSense 深度不可靠，不生成机械臂目标。",
+    "quickchanger_depth_max_mm": "quickchanger 落位前允许的最大 ArUco 深度，单位 mm。当前夹具实测深度约 270 mm；若出现几十米级异常深度，会被该上限拦截并重新取帧。",
+    "quickchanger_depth_retry_frames": "停止视角复查时，如果 ArUco 识别成功但深度超出 quickchanger_depth_min/max 范围，最多重新取帧并重试的次数。建议 3-10。",
+    "quickchanger_move_vel": "quickchanger 两阶段 MoveL 默认速度百分比，作为 stage1_move_vel/stage2_move_vel 未配置时的兼容默认值。当前测试值 70，约为旧值 35 的 2 倍；越大越快，风险也越高。",
+    "stage1_move_vel": "quickchanger 阶段1预对准 MoveL 速度百分比。阶段1不执行最终插入，当前测试值 80，约为旧值 40 的 2 倍。",
+    "stage2_move_vel": "quickchanger 阶段2最终落位 MoveL 速度百分比。当前测试值 70，约为旧值 35 的 2 倍；若最终对接冲击过大可单独降低。",
+    "demo_start": "演示扫描起点 TCP 位姿，单位 [mm, mm, mm, deg, deg, deg]，格式 [X,Y,Z,Rx,Ry,Rz]。当前起点 Y=-250。",
     "demo_end": "演示扫描终点 TCP 位姿，单位 [mm, mm, mm, deg, deg, deg]，格式 [X,Y,Z,Rx,Ry,Rz]。",
     "lost_after_visible": "首次识别到目标后，连续多少次未识别即结束扫描并开始定位。分段 demo 按扫描点计数，smooth demo 按检测帧计数。建议 1-5；越小触发越快。",
     "scan_steps": "run_quickchanger_demo 分段扫描数量。只影响分段 demo，不影响 smooth。建议 20-80；越小越快但最佳视角更粗。",
@@ -50,11 +76,18 @@
     "demo_settle_s": "run_quickchanger_demo 每个分段点到位后等待相机稳定时间，单位秒。建议 0-0.1；越小越快。",
     "min_perimeter_px": "ArUco 参与最佳视角评分的最小周长阈值，单位像素。建议 80-200；太小容易接受远处/误检目标。",
     "smooth_scan_vel": "run_quickchanger_smooth 连续扫描 MoveL 速度百分比。建议 20-80；越大扫描越快。当前 35.0 是临时稳定性测试值。",
+    "smooth_experience_move_vel": "run_quickchanger_smooth 复用经验位姿时，普通 MoveL 移动到经验位置的速度百分比。当前测试值 70，约为旧值 35 的 2 倍；该移动过程不做相机扫描，到位后才检测 ArUco。",
     "smooth_sample_hz": "run_quickchanger_smooth 连续移动时 ArUco 检测采样频率，单位 Hz。建议 12-30；高速扫描时建议接近相机帧率 30。",
     "smooth_stop_on_lost": "run_quickchanger_smooth 在连续丢失目标后是否调用 StopMotion 提前停止扫描。true 更快进入定位；false 会等待扫描 MoveL 到终点。",
     "smooth_pose_sync_mode": "run_quickchanger_smooth 图像帧与机械臂 TCP 位姿同步方式。buffer 表示后台高频采 TCP 并按图像时间插值，适合高速扫描且不阻塞识别；bracket 表示取图前后各读一次 TCP；after 为旧逻辑。建议 buffer。",
     "smooth_pose_sample_hz": "run_quickchanger_smooth 在 buffer 模式下后台 TCP 位姿采样频率，单位 Hz。建议 30-60；过高会增加控制器 XML-RPC 压力。",
     "smooth_frame_time_offset_s": "run_quickchanger_smooth 图像帧时间提前校正，单位秒。正值表示用于匹配 TCP 的图像时间更早。高速扫描回到最佳视角后偏过头时调大；回退不够时调小。建议 0.05-0.25。",
-    "smooth_scan_detect_scale": "run_quickchanger_smooth 扫描阶段 ArUco 检测图像缩放比例。0.5 表示用半分辨率检测后把中心/角点映射回原图，可显著提高扫描检测 FPS；1.0 表示原始 1920x1080 检测。建议 0.5-1.0。"
+    "smooth_scan_detect_scale": "run_quickchanger_smooth 扫描阶段 ArUco 检测图像缩放比例。0.5 表示用半分辨率检测后把中心/角点映射回原图，可显著提高扫描检测 FPS；1.0 表示原始 1920x1080 检测。建议 0.5-1.0。",
+    "smooth_stop_on_first_visible": "run_quickchanger_smooth 是否在首次识别到目标 ArUco 且满足 min_perimeter_px 后立即 StopMotion，并在当前位置复查后直接执行 quickchanger。true 表示不再回到中间匹配位置；false 表示使用历史中间匹配回位逻辑。",
+    "smooth_min_valid_before_stop": "仅在 smooth_stop_on_first_visible=false 时用于历史逻辑：目标窗口至少累计多少帧有效匹配后，才允许连续丢失触发 StopMotion。建议 2-5。",
+    "smooth_require_valid_depth_before_stop": "run_quickchanger_smooth 在扫描/经验位命中 ArUco 后，是否要求标记区域深度也在 quickchanger_depth_min/max 范围内才允许停止并进入落位。true 可避免 ID2 在边缘视角拿到十几米异常深度后触发 MoveL 112。",
+    "smooth_stop_depth_check_frames": "停止前深度确认使用的短采样帧数。只在已识别到目标 ArUco 时触发；建议 1-3，数值越大越稳但越可能让连续扫描多走一点距离。",
+    "smooth_experience_disabled_ids": "禁用经验位复用/写入的 ArUco ID 列表。当前 ID2 夹爪经实测使用扫描轨迹 Y 经验位会导致后续 MoveL 112，因此固定走扫描流程，不保存经验位。",
+    "smooth_experience_path": "按 ArUco ID 维护的经验停止位姿文件。相对路径按 calibration_hd_test 目录解析。成功完成 quickchanger stage1/stage2 后更新对应编号 stop_pose；下一次相同编号优先移动到该位置并检测。"
   }
 }

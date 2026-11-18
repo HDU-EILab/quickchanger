@@ -2,14 +2,14 @@
 
 本仓库是 FR10 + Jetson 现场交付代码，用于网页示教器、Quickchanger ArUco 自动定位演示、手眼标定配置、外设电机/供电控制和 RH56 灵巧手控制。
 
-仓库已设置为 private，面向 HDU-EILab 组织内成员查看。
+本版本从 Jetson 实际使用的网页示教和视觉扫描目录同步。现场采集图像、经验位姿缓存和部署备份不随代码发布。
 
 ## 主要功能
 
 - FR10 网页示教器：读取 TCP、MoveL 位姿移动、相对移出/移入、回 home。
 - Quickchanger ArUco 自动定位：识别 ArUco 4x4 marker，默认 ID 为 `1`。
-- Smooth 演示流程：机械臂连续平滑扫描，扫描中检测指定 ArUco 编号，多编号场景下只锁定当前流程目标编号，回到目标窗口中间视角后执行两阶段对接移动。
-- 外设控制：快换电机正反转/停止/状态/诊断、末端供电切换、HEPG 夹爪、RH56 灵巧手、电钻 20V 供电档案与 1s 点动。
+- Smooth 演示流程：支持按编号复用经验位姿，到位后验证；未命中则从最近端点方向连续扫描。只检测指定编号，满足识别和深度条件后停车，在停止视角复查，再执行两阶段对接。
+- 外设控制：灵巧手 ID1、夹爪 ID2、电钻 ID3 预设，快换电机正反转、末端供电切换，以及按当前工具执行抓紧或打开。电钻点动先关闭输出，等待 0.5 秒，再切到电钻 20V。
 - 标定支持：包含当前 active 手眼标定矩阵、RealSense 内参和现场补偿文件。
 
 ## 目录结构
@@ -84,10 +84,13 @@ quickchanger_smooth_sweep_hd.py
 web_teach_192.168.58.2/calibration_hd_test/quickchanger_config.json
 ```
 
-当前交付默认值：
+Jetson 当前默认值：
 
 ```text
 smooth_scan_vel = 35.0
+smooth_experience_move_vel = 70.0
+stage1_move_vel = 80.0
+stage2_move_vel = 70.0
 lost_after_visible = 2
 smooth_scan_detect_scale = 0.5
 smooth_frame_time_offset_s = 0.12
@@ -97,8 +100,8 @@ stage2_deadzone_mm = [-2.0, -2.0, -3.0]
 
 说明：
 
-- `smooth_scan_vel`：smooth 连续扫描 MoveL 速度百分比，当前版本临时提高到 `35.0` 以测试更快响应下的稳定性。
-- `lost_after_visible`：首次识别后连续多少帧未识别即结束扫描。
+- 速度参数分别用于连续扫描、经验位姿移动，以及对接的两个阶段。当前配置禁用夹爪 ID2 的经验位姿。
+- `lost_after_visible`：分段扫描和按丢失结束策略使用的阈值；网页默认 smooth 流程在满足识别和深度条件后即停车。
 - `smooth_scan_detect_scale`：扫描阶段 ArUco 检测缩放比例，`0.5` 表示半分辨率检测后映射回原图。
 - `smooth_frame_time_offset_s`：图像帧和 TCP 位姿匹配的时间补偿。
 - `stage1_deadzone_mm` / `stage2_deadzone_mm`：两阶段最终对接补偿。
@@ -120,6 +123,8 @@ web_teach_192.168.58.2/calibration_hd_test/README.md
 ## 现场注意事项
 
 - 运行前确认 Jetson 与 FR10 控制器 `192.168.58.2` 网络互通。
+- 网页示教器能够直接控制机械臂与供电，只应在隔离的控制网络中使用，不要将 `8890` 端口暴露到公网。
+- 发布的手眼矩阵和相机内参来自交付设备，换相机、安装位置或工装后应重新标定并验证扫描和对接位姿。
 - Quickchanger/RealSense 脚本依赖现场 conda 环境，默认配置见 `fr10_web_teach.py` 顶部 `QUICKCHANGER_*` 常量。
 - 网页示教器和 Quickchanger 脚本不会同时使用机械臂 SDK；脚本内包含对 `fr10_web_teach.py` 的抢占暂停逻辑。
 - 串口设备建议使用固定 udev 名：`/dev/fr10-motor-serial`、`/dev/fr10-hand-serial`。

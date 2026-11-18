@@ -60,7 +60,7 @@ DEVICE_PROFILES = {
     },
 }
 
-DRILL_DEMO_ON_SECONDS = 1.0
+DRILL_DEMO_ON_SECONDS = 3.0
 
 MOTOR_COMMANDS = {
     "status_run": "01 03 00 00 00 01",
@@ -675,6 +675,21 @@ class MotorPowerBus:
         return samples
 
     @staticmethod
+    def _set_power_output_verified(power: CL200WPowerSupply, turn_on: bool) -> int:
+        expected = 1 if turn_on else 0
+        if turn_on:
+            power.output_on()
+        else:
+            power.output_off()
+        output_setting = power.read_output_setting()
+        if output_setting != expected:
+            action = "打开" if turn_on else "关闭"
+            raise RuntimeError(
+                f"电源输出{action}验证失败：期望1282={expected}，实际1282={output_setting}"
+            )
+        return output_setting
+
+    @staticmethod
     def _monitor(power: CL200WPowerSupply, motor: MotorController, duration_s: float, interval_s: float) -> list:
         """实验室单总线联调用：电源 + 电机联合采样（现场双总线请分开调用）。"""
         samples = []
@@ -702,8 +717,8 @@ class MotorPowerBus:
     @classmethod
     def _switch_device(cls, power: CL200WPowerSupply, profile_key: str, confirm_power_on: bool) -> dict:
         profile = DEVICE_PROFILES[profile_key]
-        power.output_off()
-        time.sleep(0.1)
+        cls._set_power_output_verified(power, False)
+        time.sleep(0.5)
         power.set_voltage_v(profile["voltage_v"])
         time.sleep(0.05)
         power.set_current_a(profile["current_a"])
@@ -718,8 +733,16 @@ class MotorPowerBus:
                 confirm_kind="power_on",
                 profile=profile,
             )
-        power.output_on()
-        time.sleep(0.2)
+        try:
+            cls._set_power_output_verified(power, True)
+            time.sleep(0.2)
+        except Exception:
+            try:
+                power.output_off()
+            finally:
+                _device_manager_state["current_profile_key"] = None
+                _device_manager_state["current_device"] = None
+            raise
         _device_manager_state["current_profile_key"] = profile_key
         _device_manager_state["current_device"] = profile["name"]
         status = power.read_status()
@@ -730,32 +753,90 @@ class MotorPowerBus:
         )
 
     @classmethod
-    def _drill_pulse(cls, power: CL200WPowerSupply, confirm_power_on: bool) -> dict:
+    def _drill_pulse(
+        cls,
+        power: CL200WPowerSupply,
+        confirm_power_on: bool,
+        duration_s: float | None = None,
+    ) -> dict:
         profile = DEVICE_PROFILES["3"]
+        if duration_s is None:
+            duration_s = DRILL_DEMO_ON_SECONDS
+        duration_s = max(0.5, min(10.0, float(duration_s)))
         if not confirm_power_on:
             return _fail(
                 f"电钻点动会以 {profile['voltage_v']}V / {profile['current_a']}A 通电 "
-                f"{DRILL_DEMO_ON_SECONDS:.1f}s 后自动断电；请确认电钻已固定、周围无人",
+                f"{duration_s:.1f}s 后自动断电；请确认电钻已固定、周围无人",
                 needs_confirm=True,
                 confirm_kind="power_on",
                 profile=profile,
+                duration_s=duration_s,
             )
-        power.output_off()
-        time.sleep(0.1)
-        power.set_voltage_v(profile["voltage_v"])
-        time.sleep(0.05)
-        power.set_current_a(profile["current_a"])
-        time.sleep(0.05)
-        _device_manager_state["current_profile_key"] = "3"
-        _device_manager_state["current_device"] = profile["name"]
+        start_result = cls._switch_device(power, "3", True)
         try:
-            power.output_on()
-            time.sleep(DRILL_DEMO_ON_SECONDS)
+            time.sleep(duration_s)
         finally:
-            power.output_off()
+            try:
+                cls._set_power_output_verified(power, False)
+            except Exception:
+                power.output_off()
             _device_manager_state["current_profile_key"] = None
             _device_manager_state["current_device"] = None
-        return _ok(f"电钻点动完成：通电 {DRILL_DEMO_ON_SECONDS:.1f}s 后已关闭输出")
+        end_status = power.read_basic_status()
+        return _ok(
+            f"电钻点动完成：通电 {duration_s:.1f}s 后已关闭输出",
+            duration_s=duration_s,
+            start_result=start_result,
+            end_status=end_status,
+        )
+
+    @classmethod
+    def _drill_start(cls, power: CL200WPowerSupply, confirm_power_on: bool) -> dict:
+        profile = DEVICE_PROFILES["3"]
+        set_voltage_v = power.read_register(REG_SET_VOLTAGE) / 1000.0
+        set_current_a = power.read_register(REG_SET_CURRENT) / 1000.0
+        output_setting = power.read_output_setting()
+        if not confirm_power_on:
+            return _fail(
+                "电钻启动会保持电源输出开启；请确认电钻已固定、周围无人",
+                needs_confirm=True,
+                confirm_kind="power_on",
+                profile=profile,
+                set_voltage_v=set_voltage_v,
+                set_current_a=set_current_a,
+                output_setting=output_setting,
+            )
+        if output_setting == 1:
+            _device_manager_state["current_profile_key"] = "3"
+            _device_manager_state["current_device"] = profile["name"]
+            return _ok(
+                "电钻电源输出已经开启，不重复发送启动指令",
+                current_device=profile["name"],
+                power_status=power.read_status(),
+            )
+        if abs(set_voltage_v - profile["voltage_v"]) > 0.5:
+            power.set_voltage_v(profile["voltage_v"])
+            time.sleep(0.05)
+        if abs(set_current_a - profile["current_a"]) > 0.2:
+            power.set_current_a(profile["current_a"])
+            time.sleep(0.05)
+        try:
+            cls._set_power_output_verified(power, True)
+            time.sleep(0.2)
+        except Exception:
+            try:
+                power.output_off()
+            finally:
+                _device_manager_state["current_profile_key"] = None
+                _device_manager_state["current_device"] = None
+            raise
+        _device_manager_state["current_profile_key"] = "3"
+        _device_manager_state["current_device"] = profile["name"]
+        return _ok(
+            f"电钻已启动并保持输出：{profile['voltage_v']}V / {profile['current_a']}A",
+            current_device=profile["name"],
+            power_status=power.read_status(),
+        )
 
     @classmethod
     def _ensure_device(cls, power: CL200WPowerSupply, device_name: str, auto_switch: bool) -> Optional[dict]:
@@ -774,7 +855,7 @@ class MotorPowerBus:
         "bus_monitor",
         "power_set_voltage", "power_set_current", "power_output_on", "power_output_off", "power_status",
         "device_switch_hand", "device_switch_gripper", "device_switch_drill",
-        "drill_pulse",
+        "drill_start", "drill_pulse",
         "gripper_open", "gripper_close", "gripper_demo",
     })
 
@@ -873,10 +954,10 @@ class MotorPowerBus:
                     return _ok("电源输出已打开", power_status=power.read_status(), ee_port=port)
 
                 if action == "power_output_off":
-                    power.output_off()
+                    cls._set_power_output_verified(power, False)
                     _device_manager_state["current_profile_key"] = None
                     _device_manager_state["current_device"] = None
-                    return _ok("电源输出已关闭", ee_port=port)
+                    return _ok("电源输出已关闭并已验证", ee_port=port)
 
                 if action == "power_status":
                     return _ok(
@@ -923,7 +1004,16 @@ class MotorPowerBus:
                     return out
 
                 if action == "drill_pulse":
-                    out = cls._drill_pulse(power, confirm_power_on)
+                    try:
+                        duration_s = float(payload.get("duration_s", DRILL_DEMO_ON_SECONDS))
+                    except Exception:
+                        duration_s = DRILL_DEMO_ON_SECONDS
+                    out = cls._drill_pulse(power, confirm_power_on, duration_s)
+                    out["ee_port"] = port
+                    return out
+
+                if action == "drill_start":
+                    out = cls._drill_start(power, confirm_power_on)
                     out["ee_port"] = port
                     return out
 

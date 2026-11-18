@@ -69,7 +69,7 @@ PORT=9000 ./run_web_teach.sh
 
 ## Quickchanger 演示
 
-网页内 Quickchanger 演示流程支持填写 ArUco ID，默认 ID 为 `1`。当前版本已完成多编号演示流程适配：同一流程只锁定指定编号，看到其它编号即结束目标窗口并使用目标窗口内的中间有效视角。后端默认执行：
+网页内 Quickchanger 演示流程支持填写 ArUco ID，默认 ID 为 `1`。同一流程只检测指定编号；默认在满足识别和深度条件后停车，原地复查再执行两阶段对接。后端默认执行：
 
 ```text
 web_teach_192.168.58.2/calibration_hd_test/quickchanger_smooth_sweep_hd.py
@@ -92,6 +92,8 @@ cd web_teach_192.168.58.2/calibration_hd_test
 ./run_quickchanger --aruco-id 1
 ```
 
+网页后端使用 `fr10_web_teach.py` 顶部的 `QUICKCHANGER_*` 常量定位视觉脚本、Conda 和 FAIRINO SDK。部署目录与 Jetson 交付现场不同时，应先按实际安装位置更新这些常量。
+
 ## 规则与程序点
 
 - 示教逻辑、二次确认、挂起状态等见 **`web_teach_192.168.58.2/WEB_TEACH_RULES.md`**。
@@ -99,7 +101,7 @@ cd web_teach_192.168.58.2/calibration_hd_test
 
 ## 防火墙
 
-若手机或其它电脑无法访问，请在本机放行监听端口（默认 8890）的入站 TCP。
+仅在隔离的控制网络内放行监听端口（默认 8890），不要从公网访问示教器。
 
 ## 电机串口控制（已集成）
 
